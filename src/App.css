@@ -34,6 +34,50 @@
   flex-wrap: wrap;
 }
 
+.setup {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 10px;
+  width: min(560px, 100%);
+  margin: 0 auto;
+  padding: 14px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.source-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  padding-bottom: 4px;
+}
+
+.source-label {
+  color: var(--text);
+}
+
+.source-value {
+  color: var(--text-h);
+  font-weight: 600;
+}
+
+.setup-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--text-h);
+}
+
+.setup-item input {
+  width: 16px;
+  height: 16px;
+}
+
+.start {
+  margin-top: 4px;
+}
+
 .status-message {
   margin: 4px 0 0;
   text-align: center;
@@ -98,5 +142,9 @@
 
   .control-button {
     min-width: 96px;
+  }
+
+  .setup {
+    width: 100%;
   }
 }

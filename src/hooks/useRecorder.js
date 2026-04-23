@@ -1,8 +1,11 @@
 import { useEffect, useRef, useState } from 'react'
 
 const RECORDING_OPTIONS = [
+  // Prefer hardware-accelerated encoders first when available.
+  'video/mp4;codecs=avc1.640028,mp4a.40.2',
   'video/mp4;codecs=avc1.42E01E,mp4a.40.2',
   'video/mp4',
+  'video/webm;codecs=av01.0.08M.08,opus',
   'video/webm;codecs=vp9,opus',
   'video/webm;codecs=vp8,opus',
   'video/webm',
@@ -47,6 +50,17 @@ function supportsWorkerComposition() {
     typeof window.VideoFrame !== 'undefined' &&
     typeof window.OffscreenCanvas !== 'undefined'
   )
+}
+
+function getAlignedVideoDimensions(track, fallbackWidth, fallbackHeight) {
+  const settings = track.getSettings?.() ?? {}
+  const rawWidth = Number.isFinite(settings.width) ? settings.width : fallbackWidth
+  const rawHeight = Number.isFinite(settings.height) ? settings.height : fallbackHeight
+
+  const width = Math.max(2, Math.floor(rawWidth))
+  const height = Math.max(2, Math.floor(rawHeight))
+
+  return { width, height }
 }
 
 export function useRecorder() {
@@ -298,9 +312,13 @@ export function useRecorder() {
     cameraVideo.playsInline = true
     await cameraVideo.play()
 
-    const settings = displayTrack.getSettings?.() ?? {}
-    const canvasWidth = Math.max(1280, settings.width || window.screen.width || 1920)
-    const canvasHeight = Math.max(720, settings.height || window.screen.height || 1080)
+    const fallbackWidth = screenVideo.videoWidth || window.screen.width || 1920
+    const fallbackHeight = screenVideo.videoHeight || window.screen.height || 1080
+    const { width: canvasWidth, height: canvasHeight } = getAlignedVideoDimensions(
+      displayTrack,
+      fallbackWidth,
+      fallbackHeight,
+    )
 
     const canvas = document.createElement('canvas')
     canvas.width = canvasWidth
@@ -343,9 +361,11 @@ export function useRecorder() {
   }
 
   const createWorkerComposedTrack = async (displayTrack, cameraTrack) => {
-    const settings = displayTrack.getSettings?.() ?? {}
-    const width = Math.max(1280, settings.width || window.screen.width || 1920)
-    const height = Math.max(720, settings.height || window.screen.height || 1080)
+    const { width, height } = getAlignedVideoDimensions(
+      displayTrack,
+      window.screen.width || 1920,
+      window.screen.height || 1080,
+    )
 
     const compositionId = Date.now()
     compositorIdRef.current = compositionId
@@ -464,6 +484,10 @@ export function useRecorder() {
 
       const finalStream = new MediaStream(finalTracks)
       activePreviewStreamRef.current = finalStream
+
+      if (recordingVideoTrack && 'contentHint' in recordingVideoTrack) {
+        recordingVideoTrack.contentHint = 'detail'
+      }
 
       const mimeType = pickRecorderMimeType()
       const recorder = new MediaRecorder(

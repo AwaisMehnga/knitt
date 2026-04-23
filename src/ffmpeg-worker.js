@@ -50,8 +50,6 @@ self.onmessage = async ({ data }) => {
         '0:v:0',
         '-map',
         '0:a:0?',
-        '-vf',
-        'scale=trunc(iw/2)*2:trunc(ih/2)*2',
         '-c:v',
         'mpeg4',
         '-q:v',

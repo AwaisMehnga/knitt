@@ -26,16 +26,6 @@ function RecorderSetup({ options, onOptionChange, onStart, startDisabled }) {
         <span>Microphone audio</span>
       </label>
 
-      <label className="setup-item" htmlFor="include-system-audio">
-        <input
-          id="include-system-audio"
-          type="checkbox"
-          checked={options.includeSystemAudio}
-          onChange={(event) => onOptionChange('includeSystemAudio', event.target.checked)}
-        />
-        <span>System audio</span>
-      </label>
-
       <button
         type="button"
         className="control-button start"

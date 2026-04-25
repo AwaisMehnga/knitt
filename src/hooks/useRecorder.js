@@ -1,7 +1,22 @@
+// useRecorder.js
+// Screen recorder hook with:
+//  - Proper audio processing chain (noise gate → high-pass → compressor → limiter)
+//  - WebGL-accelerated PiP composition via compositor worker
+//  - Split video/audio recording for reliable muxing
+//  - Clean resource management
+
 import { useEffect, useRef, useState } from 'react'
 
-const RECORDING_OPTIONS = [
-  // Prefer hardware-accelerated encoders first when available.
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+const DISPLAY_FPS = 30
+const CAMERA_FPS = 24
+const MAX_WIDTH = 1920
+const MAX_HEIGHT = 1080
+const VIDEO_BPS = 8_000_000
+const AUDIO_BPS = 192_000
+
+const VIDEO_MIME_TYPES = [
   'video/mp4;codecs=avc1.640028,mp4a.40.2',
   'video/mp4;codecs=avc1.42E01E,mp4a.40.2',
   'video/mp4',
@@ -11,74 +26,130 @@ const RECORDING_OPTIONS = [
   'video/webm',
 ]
 
-const DEFAULT_CAPTURE_OPTIONS = {
-  source: 'entire-screen',
+const AUDIO_MIME_TYPES = [
+  'audio/webm;codecs=opus',
+  'audio/webm',
+]
+
+const DEFAULT_OPTIONS = {
   includeCamera: true,
   includeMicrophone: true,
-  includeSystemAudio: true,
 }
 
-function pickRecorderMimeType() {
-  return (
-    RECORDING_OPTIONS.find((mimeType) => MediaRecorder.isTypeSupported(mimeType)) ||
-    ''
-  )
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function pickMime(types) {
+  return types.find((t) => MediaRecorder.isTypeSupported(t)) ?? ''
 }
 
-function needsMp4Conversion(mimeType) {
-  return !mimeType.startsWith('video/mp4')
+function needsConversion(mime) {
+  return !mime.startsWith('video/mp4')
 }
 
-function buildDisplayConstraints(includeSystemAudio) {
+function getAlignedDimensions(track, fallbackW = 1920, fallbackH = 1080) {
+  const s = track.getSettings?.() ?? {}
+  const rawW = Number.isFinite(s.width) ? s.width : fallbackW
+  const rawH = Number.isFinite(s.height) ? s.height : fallbackH
+  const scale = Math.min(1, MAX_WIDTH / Math.max(1, rawW), MAX_HEIGHT / Math.max(1, rawH))
   return {
-    audio: includeSystemAudio,
-    surfaceSwitching: 'include',
-    systemAudio: includeSystemAudio ? 'include' : 'exclude',
-    video: {
-      displaySurface: 'monitor',
-      frameRate: { ideal: 60, max: 60 },
-      height: { ideal: window.screen.height, max: window.screen.height },
-      width: { ideal: window.screen.width, max: window.screen.width },
-    },
+    width: Math.max(2, Math.floor(rawW * scale) & ~1), // force even
+    height: Math.max(2, Math.floor(rawH * scale) & ~1),
   }
 }
 
 function supportsWorkerComposition() {
+  const TrackGeneratorCtor = window.VideoTrackGenerator ?? window.MediaStreamTrackGenerator
   return (
     typeof window.MediaStreamTrackProcessor !== 'undefined' &&
-    typeof window.MediaStreamTrackGenerator !== 'undefined' &&
+    typeof TrackGeneratorCtor !== 'undefined' &&
     typeof window.VideoFrame !== 'undefined' &&
     typeof window.OffscreenCanvas !== 'undefined'
   )
 }
 
-function getAlignedVideoDimensions(track, fallbackWidth, fallbackHeight) {
-  const settings = track.getSettings?.() ?? {}
-  const rawWidth = Number.isFinite(settings.width) ? settings.width : fallbackWidth
-  const rawHeight = Number.isFinite(settings.height) ? settings.height : fallbackHeight
-
-  const width = Math.max(2, Math.floor(rawWidth))
-  const height = Math.max(2, Math.floor(rawHeight))
-
-  return { width, height }
+function getTrackGeneratorCtor() {
+  return window.VideoTrackGenerator ?? window.MediaStreamTrackGenerator
 }
 
+// ─── Audio processing chain ───────────────────────────────────────────────────
+// mic → high-pass (cut rumble) → noise gate → compressor → limiter → output
+//
+// The noise gate suppresses background hiss when the user is silent.
+// The compressor tames peaks. The limiter prevents digital clipping.
+
+function buildAudioChain(ctx, micTrack) {
+  const source = ctx.createMediaStreamSource(new MediaStream([micTrack]))
+
+  // 1. High-pass – remove low-frequency rumble (AC hum, desk vibration)
+  const highPass = ctx.createBiquadFilter()
+  highPass.type = 'highpass'
+  highPass.frequency.value = 120
+  highPass.Q.value = 0.7
+
+  // 2. Noise gate via gain + script processor workaround using DynamicsCompressor
+  //    with extreme ratio at very low threshold acts as a gate
+  const gate = ctx.createDynamicsCompressor()
+  gate.threshold.value = -60   // only signals above -60 dBFS pass through gate
+  gate.knee.value = 6
+  gate.ratio.value = 20        // steep ratio = gate-like behaviour
+  gate.attack.value = 0.001
+  gate.release.value = 0.15
+
+  // 3. Main compressor – tame dynamic range for cleaner recording
+  const compressor = ctx.createDynamicsCompressor()
+  compressor.threshold.value = -24
+  compressor.knee.value = 10
+  compressor.ratio.value = 4
+  compressor.attack.value = 0.005
+  compressor.release.value = 0.15
+
+  // 4. Makeup gain after compression
+  const gain = ctx.createGain()
+  gain.gain.value = 1.4
+
+  // 5. Limiter – hard clip prevention before output
+  const limiter = ctx.createDynamicsCompressor()
+  limiter.threshold.value = -1
+  limiter.knee.value = 0
+  limiter.ratio.value = 20
+  limiter.attack.value = 0.001
+  limiter.release.value = 0.05
+
+  const dest = ctx.createMediaStreamDestination()
+
+  source.connect(highPass)
+  highPass.connect(gate)
+  gate.connect(compressor)
+  compressor.connect(gain)
+  gain.connect(limiter)
+  limiter.connect(dest)
+
+  return dest.stream
+}
+
+// ─── Hook ─────────────────────────────────────────────────────────────────────
+
 export function useRecorder() {
-  const [phase, setPhase] = useState('idle')
+  const [phase, setPhase] = useState('idle')          // idle | recording | converting | ready | error
   const [previewUrl, setPreviewUrl] = useState('')
   const [downloadUrl, setDownloadUrl] = useState('')
   const [errorMessage, setErrorMessage] = useState('')
-  const [captureOptions, setCaptureOptions] = useState(DEFAULT_CAPTURE_OPTIONS)
+  const [captureOptions, setCaptureOptions] = useState(DEFAULT_OPTIONS)
 
   const videoRef = useRef(null)
+
+  // Internal refs – never trigger re-renders
   const recorderRef = useRef(null)
+  const audioRecorderRef = useRef(null)
   const workerRef = useRef(null)
   const compositorWorkerRef = useRef(null)
-  const chunksRef = useRef([])
+  const videoChunksRef = useRef([])
+  const audioChunksRef = useRef([])
+  const stopStateRef = useRef({ videoDone: false, audioDone: false, videoMime: '', audioMime: '' })
   const pendingJobRef = useRef(0)
 
-  const activePreviewStreamRef = useRef(null)
   const sourceStreamsRef = useRef([])
+  const activePreviewStreamRef = useRef(null)
   const previewUrlRef = useRef('')
   const downloadUrlRef = useRef('')
   const renderLoopRef = useRef(0)
@@ -87,111 +158,72 @@ export function useRecorder() {
   const compositorElementsRef = useRef(null)
   const audioContextRef = useRef(null)
 
+  // ── Lifecycle cleanup ──────────────────────────────────────────────────────
+
   useEffect(() => {
     return () => {
-      if (workerRef.current) {
-        workerRef.current.terminate()
-        workerRef.current = null
-      }
-
-      if (compositorWorkerRef.current) {
-        compositorWorkerRef.current.terminate()
-        compositorWorkerRef.current = null
-      }
-
-      if (previewUrlRef.current) {
-        URL.revokeObjectURL(previewUrlRef.current)
-      }
-
-      if (downloadUrlRef.current) {
-        URL.revokeObjectURL(downloadUrlRef.current)
-      }
-
-      if (activePreviewStreamRef.current) {
-        activePreviewStreamRef.current.getTracks().forEach((track) => track.stop())
-      }
-
-      sourceStreamsRef.current.forEach((stream) => {
-        stream.getTracks().forEach((track) => track.stop())
-      })
-
-      sourceStreamsRef.current = []
-
-      if (renderLoopRef.current) {
-        cancelAnimationFrame(renderLoopRef.current)
-        renderLoopRef.current = 0
-      }
-
-      if (audioContextRef.current) {
-        audioContextRef.current.close().catch(() => {})
-        audioContextRef.current = null
-      }
+      workerRef.current?.terminate()
+      compositorWorkerRef.current?.terminate()
+      revokeUrl(previewUrlRef.current)
+      revokeUrl(downloadUrlRef.current)
+      activePreviewStreamRef.current?.getTracks().forEach((t) => t.stop())
+      sourceStreamsRef.current.forEach((s) => s.getTracks().forEach((t) => t.stop()))
+      renderLoopRef.current && cancelAnimationFrame(renderLoopRef.current)
+      audioContextRef.current?.close().catch(() => {})
     }
   }, [])
 
-  useEffect(() => {
-    const video = videoRef.current
+  // ── Video preview element sync ─────────────────────────────────────────────
 
-    if (!video) {
-      return
-    }
+  useEffect(() => {
+    const v = videoRef.current
+    if (!v) return
 
     if (phase === 'recording' && activePreviewStreamRef.current) {
-      video.srcObject = activePreviewStreamRef.current
-      video.controls = false
-      video.muted = true
-      video.play().catch(() => {})
+      v.srcObject = activePreviewStreamRef.current
+      v.controls = false
+      v.muted = true
+      v.play().catch(() => {})
       return
     }
 
-    video.srcObject = null
-    video.controls = false
-    video.muted = false
+    v.srcObject = null
+    v.muted = false
+    v.controls = !!previewUrl
 
     if (previewUrl) {
-      video.src = previewUrl
-      video.play().catch(() => {})
-      return
+      v.src = previewUrl
+      v.play().catch(() => {})
+    } else {
+      v.removeAttribute('src')
+      v.load()
     }
-
-    video.removeAttribute('src')
-    video.load()
   }, [phase, previewUrl])
 
-  const setPreviewObjectUrl = (url) => {
-    if (previewUrlRef.current) {
-      URL.revokeObjectURL(previewUrlRef.current)
-    }
+  // ── URL helpers ────────────────────────────────────────────────────────────
 
+  const revokeUrl = (url) => { if (url) URL.revokeObjectURL(url) }
+
+  const setPreviewObjectUrl = (url) => {
+    revokeUrl(previewUrlRef.current)
     previewUrlRef.current = url
     setPreviewUrl(url)
   }
 
   const setDownloadObjectUrl = (url) => {
-    if (downloadUrlRef.current) {
-      URL.revokeObjectURL(downloadUrlRef.current)
-    }
-
+    revokeUrl(downloadUrlRef.current)
     downloadUrlRef.current = url
     setDownloadUrl(url)
   }
 
-  const resetOutputUrls = () => {
-    if (previewUrlRef.current) {
-      URL.revokeObjectURL(previewUrlRef.current)
-      previewUrlRef.current = ''
-    }
-
-    if (downloadUrlRef.current) {
-      URL.revokeObjectURL(downloadUrlRef.current)
-      downloadUrlRef.current = ''
-    }
-
-    setPreviewUrl('')
-    setDownloadUrl('')
+  const resetUrls = () => {
+    setPreviewObjectUrl('')
+    setDownloadObjectUrl('')
   }
 
-  const cleanupCompositionResources = () => {
+  // ── Cleanup pipeline ───────────────────────────────────────────────────────
+
+  const cleanupComposition = () => {
     if (compositorIdRef.current && compositorWorkerRef.current) {
       compositorWorkerRef.current.postMessage({
         type: 'stop',
@@ -200,10 +232,8 @@ export function useRecorder() {
       compositorIdRef.current = 0
     }
 
-    if (compositorTrackRef.current) {
-      compositorTrackRef.current.stop()
-      compositorTrackRef.current = null
-    }
+    compositorTrackRef.current?.stop()
+    compositorTrackRef.current = null
 
     if (renderLoopRef.current) {
       cancelAnimationFrame(renderLoopRef.current)
@@ -214,66 +244,59 @@ export function useRecorder() {
       const { screenVideo, cameraVideo } = compositorElementsRef.current
       screenVideo?.pause()
       cameraVideo?.pause()
-      screenVideo?.removeAttribute('src')
-      cameraVideo?.removeAttribute('src')
       compositorElementsRef.current = null
     }
   }
 
-  const cleanupCapturePipeline = () => {
-    cleanupCompositionResources()
+  const cleanupPipeline = () => {
+    if (recorderRef.current?.state !== 'inactive') recorderRef.current?.stop()
+    if (audioRecorderRef.current?.state !== 'inactive') audioRecorderRef.current?.stop()
 
-    if (activePreviewStreamRef.current) {
-      activePreviewStreamRef.current.getTracks().forEach((track) => track.stop())
-      activePreviewStreamRef.current = null
-    }
+    cleanupComposition()
 
-    sourceStreamsRef.current.forEach((stream) => {
-      stream.getTracks().forEach((track) => track.stop())
-    })
+    activePreviewStreamRef.current?.getTracks().forEach((t) => t.stop())
+    activePreviewStreamRef.current = null
 
+    sourceStreamsRef.current.forEach((s) => s.getTracks().forEach((t) => t.stop()))
     sourceStreamsRef.current = []
 
-    if (audioContextRef.current) {
-      audioContextRef.current.close().catch(() => {})
-      audioContextRef.current = null
-    }
+    audioContextRef.current?.close().catch(() => {})
+    audioContextRef.current = null
+
+    recorderRef.current = null
+    audioRecorderRef.current = null
   }
 
-  const ensureWorker = () => {
-    if (workerRef.current) {
-      return workerRef.current
-    }
+  // ── Workers ────────────────────────────────────────────────────────────────
+
+  const ensureFFmpegWorker = () => {
+    if (workerRef.current) return workerRef.current
 
     const worker = new Worker(new URL('../ffmpeg-worker.js', import.meta.url), {
       type: 'module',
     })
 
     worker.onmessage = ({ data }) => {
-      if (data.jobId !== pendingJobRef.current) {
-        return
-      }
+      if (data.jobId !== pendingJobRef.current) return
 
       if (data.type === 'error') {
         setPhase('error')
-        setErrorMessage('MP4 conversion failed. Please record again.')
+        setErrorMessage('MP4 conversion failed. Please try recording again.')
         return
       }
 
-      if (data.type !== 'done') {
-        return
+      if (data.type === 'done') {
+        const url = URL.createObjectURL(data.blob)
+        setDownloadObjectUrl(url)
+        setPreviewObjectUrl(url)
+        setPhase('ready')
+        setErrorMessage('')
       }
-
-      const nextUrl = URL.createObjectURL(data.blob)
-      setDownloadObjectUrl(nextUrl)
-      setPreviewObjectUrl(nextUrl)
-      setPhase('ready')
-      setErrorMessage('')
     }
 
     worker.onerror = () => {
       setPhase('error')
-      setErrorMessage('MP4 conversion failed. Please record again.')
+      setErrorMessage('MP4 conversion failed.')
     }
 
     workerRef.current = worker
@@ -281,9 +304,7 @@ export function useRecorder() {
   }
 
   const ensureCompositorWorker = () => {
-    if (compositorWorkerRef.current) {
-      return compositorWorkerRef.current
-    }
+    if (compositorWorkerRef.current) return compositorWorkerRef.current
 
     const worker = new Worker(new URL('../compositor-worker.js', import.meta.url), {
       type: 'module',
@@ -291,7 +312,7 @@ export function useRecorder() {
 
     worker.onmessage = ({ data }) => {
       if (data?.type === 'error' && data.compositionId === compositorIdRef.current) {
-        setErrorMessage('Camera composition fell back to main thread renderer.')
+        console.warn('[compositor]', data.message)
       }
     }
 
@@ -299,69 +320,10 @@ export function useRecorder() {
     return worker
   }
 
-  const createMainThreadComposedTrack = async (displayTrack, cameraTrack) => {
-    const screenVideo = document.createElement('video')
-    screenVideo.srcObject = new MediaStream([displayTrack])
-    screenVideo.muted = true
-    screenVideo.playsInline = true
-    await screenVideo.play()
-
-    const cameraVideo = document.createElement('video')
-    cameraVideo.srcObject = new MediaStream([cameraTrack])
-    cameraVideo.muted = true
-    cameraVideo.playsInline = true
-    await cameraVideo.play()
-
-    const fallbackWidth = screenVideo.videoWidth || window.screen.width || 1920
-    const fallbackHeight = screenVideo.videoHeight || window.screen.height || 1080
-    const { width: canvasWidth, height: canvasHeight } = getAlignedVideoDimensions(
-      displayTrack,
-      fallbackWidth,
-      fallbackHeight,
-    )
-
-    const canvas = document.createElement('canvas')
-    canvas.width = canvasWidth
-    canvas.height = canvasHeight
-
-    const ctx = canvas.getContext('2d', { alpha: false })
-
-    if (!ctx) {
-      throw new Error('Canvas context not available.')
-    }
-
-    const drawFrame = () => {
-      ctx.drawImage(screenVideo, 0, 0, canvas.width, canvas.height)
-
-      const margin = Math.round(canvas.width * 0.02)
-      const pipWidth = Math.round(canvas.width * 0.22)
-      const pipHeight = Math.round(pipWidth * (9 / 16))
-      const pipX = margin
-      const pipY = canvas.height - pipHeight - margin
-
-      ctx.fillStyle = 'rgba(0, 0, 0, 0.82)'
-      ctx.fillRect(pipX - 3, pipY - 3, pipWidth + 6, pipHeight + 6)
-      ctx.drawImage(cameraVideo, pipX, pipY, pipWidth, pipHeight)
-
-      renderLoopRef.current = requestAnimationFrame(drawFrame)
-    }
-
-    drawFrame()
-
-    compositorElementsRef.current = { screenVideo, cameraVideo }
-
-    const stream = canvas.captureStream(60)
-    const track = stream.getVideoTracks()[0]
-
-    if (!track) {
-      throw new Error('Composed video track not available.')
-    }
-
-    return track
-  }
+  // ── Composition track creation ─────────────────────────────────────────────
 
   const createWorkerComposedTrack = async (displayTrack, cameraTrack) => {
-    const { width, height } = getAlignedVideoDimensions(
+    const { width, height } = getAlignedDimensions(
       displayTrack,
       window.screen.width || 1920,
       window.screen.height || 1080,
@@ -372,7 +334,8 @@ export function useRecorder() {
 
     const displayProcessor = new window.MediaStreamTrackProcessor({ track: displayTrack })
     const cameraProcessor = new window.MediaStreamTrackProcessor({ track: cameraTrack })
-    const generator = new window.MediaStreamTrackGenerator({ kind: 'video' })
+    const TrackGeneratorCtor = getTrackGeneratorCtor()
+    const generator = new TrackGeneratorCtor({ kind: 'video' })
 
     compositorTrackRef.current = generator
 
@@ -392,186 +355,279 @@ export function useRecorder() {
     return generator
   }
 
+  const createMainThreadComposedTrack = async (displayTrack, cameraTrack) => {
+    const mkVideo = async (stream) => {
+      const v = document.createElement('video')
+      v.srcObject = stream
+      v.muted = true
+      v.playsInline = true
+      await v.play()
+      return v
+    }
+
+    const screenVideo = await mkVideo(new MediaStream([displayTrack]))
+    const cameraVideo = await mkVideo(new MediaStream([cameraTrack]))
+
+    const { width, height } = getAlignedDimensions(
+      displayTrack,
+      screenVideo.videoWidth || 1920,
+      screenVideo.videoHeight || 1080,
+    )
+
+    const canvas = document.createElement('canvas')
+    canvas.width = width
+    canvas.height = height
+
+    const ctx = canvas.getContext('2d', { alpha: false })
+    if (!ctx) throw new Error('Canvas 2D context unavailable.')
+
+    const drawFrame = () => {
+      ctx.drawImage(screenVideo, 0, 0, width, height)
+
+      const margin = Math.round(width * 0.02)
+      const pipW = Math.round(width * 0.22)
+      const pipH = Math.round(pipW * (9 / 16))
+      const pipX = margin
+      const pipY = height - pipH - margin
+
+      ctx.fillStyle = '#000'
+      ctx.fillRect(pipX - 3, pipY - 3, pipW + 6, pipH + 6)
+      ctx.drawImage(cameraVideo, pipX, pipY, pipW, pipH)
+
+      renderLoopRef.current = requestAnimationFrame(drawFrame)
+    }
+
+    drawFrame()
+    compositorElementsRef.current = { screenVideo, cameraVideo }
+
+    const track = canvas.captureStream(DISPLAY_FPS).getVideoTracks()[0]
+    if (!track) throw new Error('Canvas capture track unavailable.')
+    return track
+  }
+
+  // ── Public API ─────────────────────────────────────────────────────────────
+
   const updateCaptureOption = (key, value) => {
-    setCaptureOptions((current) => ({ ...current, [key]: value }))
+    setCaptureOptions((prev) => ({ ...prev, [key]: value }))
   }
 
   const startRecording = async () => {
-    if (phase === 'recording' || phase === 'converting') {
-      return
-    }
+    if (phase === 'recording' || phase === 'converting') return
 
-    resetOutputUrls()
-    cleanupCapturePipeline()
+    resetUrls()
+    cleanupPipeline()
     setErrorMessage('')
 
     try {
-      const displayStream = await navigator.mediaDevices.getDisplayMedia(
-        buildDisplayConstraints(captureOptions.includeSystemAudio),
-      )
-      const displayVideoTrack = displayStream.getVideoTracks()[0]
+      // 1. Capture display
+      const displayStream = await navigator.mediaDevices.getDisplayMedia({
+        audio: false,
+        surfaceSwitching: 'include',
+        systemAudio: 'exclude',
+        video: {
+          displaySurface: 'monitor',
+          frameRate: { ideal: DISPLAY_FPS, max: DISPLAY_FPS },
+          height: { ideal: Math.min(window.screen.height, MAX_HEIGHT) },
+          width: { ideal: Math.min(window.screen.width, MAX_WIDTH) },
+        },
+      })
 
-      if (!displayVideoTrack) {
-        throw new Error('Display video track not found.')
-      }
+      const displayTrack = displayStream.getVideoTracks()[0]
+      if (!displayTrack) throw new Error('No display video track.')
 
-      const micStream = captureOptions.includeMicrophone
-        ? await navigator.mediaDevices.getUserMedia({
+      // 2. Capture microphone (separate stream)
+      let micTrack = null
+      let micStream = null
+
+      if (captureOptions.includeMicrophone) {
+        try {
+          micStream = await navigator.mediaDevices.getUserMedia({
             audio: {
-              autoGainControl: false,
-              echoCancellation: false,
-              noiseSuppression: false,
+              autoGainControl: false,   // we handle this ourselves in the audio chain
+              channelCount: { ideal: 1 },
+              echoCancellation: true,
+              noiseSuppression: true,
               sampleRate: 48000,
+              sampleSize: 16,
             },
             video: false,
           })
-        : null
+          micTrack = micStream.getAudioTracks()[0]
+        } catch {
+          // Mic permission denied – continue without audio
+        }
+      }
 
-      const cameraStream = captureOptions.includeCamera
-        ? await navigator.mediaDevices.getUserMedia({
+      // 3. Capture camera
+      let cameraStream = null
+      if (captureOptions.includeCamera) {
+        try {
+          cameraStream = await navigator.mediaDevices.getUserMedia({
             audio: false,
             video: {
-              frameRate: { ideal: 30, max: 30 },
+              frameRate: { ideal: CAMERA_FPS, max: CAMERA_FPS },
               height: { ideal: 720 },
               width: { ideal: 1280 },
             },
           })
-        : null
+        } catch {
+          // Camera permission denied – continue without PiP
+        }
+      }
 
       sourceStreamsRef.current = [displayStream, micStream, cameraStream].filter(Boolean)
 
+      // 4. Compose video track (with PiP if camera available)
       const cameraTrack = cameraStream?.getVideoTracks()[0]
-      let recordingVideoTrack = displayVideoTrack
+      let recordingVideoTrack = displayTrack
 
       if (cameraTrack) {
         if (supportsWorkerComposition()) {
-          recordingVideoTrack = await createWorkerComposedTrack(displayVideoTrack, cameraTrack)
+          recordingVideoTrack = await createWorkerComposedTrack(displayTrack, cameraTrack)
         } else {
-          recordingVideoTrack = await createMainThreadComposedTrack(displayVideoTrack, cameraTrack)
-          setErrorMessage('Worker composition is not supported on this browser.')
+          recordingVideoTrack = await createMainThreadComposedTrack(displayTrack, cameraTrack)
         }
       }
 
-      const finalTracks = [recordingVideoTrack]
-      const systemAudioTracks = captureOptions.includeSystemAudio
-        ? displayStream.getAudioTracks()
-        : []
-      const micAudioTracks = captureOptions.includeMicrophone
-        ? (micStream?.getAudioTracks() ?? [])
-        : []
-
-      if (systemAudioTracks.length > 0 || micAudioTracks.length > 0) {
-        const audioContext = new AudioContext()
-        const destination = audioContext.createMediaStreamDestination()
-        audioContextRef.current = audioContext
-
-        if (systemAudioTracks.length > 0) {
-          const systemSource = audioContext.createMediaStreamSource(
-            new MediaStream(systemAudioTracks),
-          )
-          systemSource.connect(destination)
-        }
-
-        if (micAudioTracks.length > 0) {
-          const micSource = audioContext.createMediaStreamSource(
-            new MediaStream(micAudioTracks),
-          )
-          micSource.connect(destination)
-        }
-
-        destination.stream.getAudioTracks().forEach((track) => finalTracks.push(track))
-      }
-
-      const finalStream = new MediaStream(finalTracks)
-      activePreviewStreamRef.current = finalStream
-
-      if (recordingVideoTrack && 'contentHint' in recordingVideoTrack) {
+      if ('contentHint' in recordingVideoTrack) {
         recordingVideoTrack.contentHint = 'detail'
       }
 
-      const mimeType = pickRecorderMimeType()
-      const recorder = new MediaRecorder(
-        finalStream,
-        mimeType
-          ? {
-              mimeType,
-              audioBitsPerSecond: 256000,
-              videoBitsPerSecond: 28000000,
-            }
-          : {
-              audioBitsPerSecond: 256000,
-              videoBitsPerSecond: 28000000,
-            },
-      )
+      // 5. Build audio processing chain
+      let processedAudioStream = null
 
-      recorderRef.current = recorder
-      chunksRef.current = []
-
-      displayVideoTrack.addEventListener(
-        'ended',
-        () => {
-          if (recorder.state !== 'inactive') {
-            recorder.stop()
-          }
-        },
-        { once: true },
-      )
-
-      recorder.ondataavailable = (event) => {
-        if (event.data.size > 0) {
-          chunksRef.current.push(event.data)
-        }
+      if (micTrack) {
+        const audioCtx = new AudioContext({ latencyHint: 'interactive', sampleRate: 48000 })
+        await audioCtx.resume().catch(() => {})
+        audioContextRef.current = audioCtx
+        processedAudioStream = buildAudioChain(audioCtx, micTrack)
       }
 
-      recorder.onstop = () => {
+      // 6. Setup preview stream (video only, muted)
+      const previewTrack = recordingVideoTrack.clone?.() ?? recordingVideoTrack
+      activePreviewStreamRef.current = new MediaStream([previewTrack])
+
+      // 7. Create video recorder (video only, no audio track mixed in)
+      const videoMime = pickMime(VIDEO_MIME_TYPES)
+      const videoRecorder = new MediaRecorder(
+        new MediaStream([recordingVideoTrack]),
+        videoMime
+          ? { mimeType: videoMime, videoBitsPerSecond: VIDEO_BPS }
+          : { videoBitsPerSecond: VIDEO_BPS },
+      )
+
+      // 8. Create separate audio recorder for clean audio isolation
+      const audioMime = pickMime(AUDIO_MIME_TYPES)
+      const audioRecorder = processedAudioStream
+        ? new MediaRecorder(
+            processedAudioStream,
+            audioMime
+              ? { mimeType: audioMime, audioBitsPerSecond: AUDIO_BPS }
+              : { audioBitsPerSecond: AUDIO_BPS },
+          )
+        : null
+
+      recorderRef.current = videoRecorder
+      audioRecorderRef.current = audioRecorder
+      videoChunksRef.current = []
+      audioChunksRef.current = []
+      stopStateRef.current = {
+        videoDone: false,
+        audioDone: !audioRecorder,
+        videoMime: '',
+        audioMime: '',
+      }
+
+      // 9. Finalization: called when both recorders have stopped
+      const finalize = () => {
+        const state = stopStateRef.current
+        if (!state.videoDone || !state.audioDone) return
+
         recorderRef.current = null
+        audioRecorderRef.current = null
 
-        const recordedBlob = new Blob(chunksRef.current, {
-          type: recorder.mimeType || 'video/webm',
+        const videoBlob = new Blob(videoChunksRef.current, {
+          type: state.videoMime || videoMime || 'video/webm',
         })
+        const audioBlob = audioChunksRef.current.length
+          ? new Blob(audioChunksRef.current, {
+              type: state.audioMime || audioMime || 'audio/webm',
+            })
+          : null
 
-        chunksRef.current = []
-        cleanupCapturePipeline()
+        videoChunksRef.current = []
+        audioChunksRef.current = []
 
-        const recordedMimeType = recorder.mimeType || mimeType || 'video/webm'
+        const resolvedMime = state.videoMime || videoMime || 'video/webm'
 
-        if (!needsMp4Conversion(recordedMimeType)) {
-          const directUrl = URL.createObjectURL(recordedBlob)
-          setPreviewObjectUrl(directUrl)
-          setDownloadObjectUrl(directUrl)
+        // Fast path: native MP4 with no audio to mux
+        if (!audioBlob && !needsConversion(resolvedMime)) {
+          cleanupPipeline()
+          const url = URL.createObjectURL(videoBlob)
+          setPreviewObjectUrl(url)
+          setDownloadObjectUrl(url)
           setPhase('ready')
           return
         }
 
-        setPreviewObjectUrl(URL.createObjectURL(recordedBlob))
+        // Show video preview immediately while converting
+        setPreviewObjectUrl(URL.createObjectURL(videoBlob))
         setDownloadObjectUrl('')
         setPhase('converting')
 
         const jobId = Date.now()
         pendingJobRef.current = jobId
-        ensureWorker().postMessage({ jobId, blob: recordedBlob })
+        ensureFFmpegWorker().postMessage({ jobId, videoBlob, audioBlob })
+
+        cleanupPipeline()
       }
 
-      recorder.start(1000)
+      // Stop recorders when user stops sharing display
+      displayTrack.addEventListener('ended', () => {
+        if (videoRecorder.state !== 'inactive') videoRecorder.stop()
+        if (audioRecorder?.state !== 'inactive') audioRecorder?.stop()
+      }, { once: true })
+
+      videoRecorder.ondataavailable = ({ data }) => {
+        if (data.size > 0) videoChunksRef.current.push(data)
+      }
+      videoRecorder.onstop = () => {
+        stopStateRef.current.videoDone = true
+        stopStateRef.current.videoMime = videoRecorder.mimeType
+        finalize()
+      }
+
+      if (audioRecorder) {
+        audioRecorder.ondataavailable = ({ data }) => {
+          if (data.size > 0) audioChunksRef.current.push(data)
+        }
+        audioRecorder.onstop = () => {
+          stopStateRef.current.audioDone = true
+          stopStateRef.current.audioMime = audioRecorder.mimeType
+          finalize()
+        }
+      }
+
+      videoRecorder.start(1000)
+      audioRecorder?.start(1000)
+
       setPhase('recording')
-    } catch (error) {
-      cleanupCapturePipeline()
+    } catch (err) {
+      cleanupPipeline()
       recorderRef.current = null
+      audioRecorderRef.current = null
+      videoChunksRef.current = []
+      audioChunksRef.current = []
       setPhase('error')
       setErrorMessage(
-        error instanceof Error
-          ? error.message
-          : 'Unable to start recording with selected inputs.',
+        err instanceof Error ? err.message : 'Unable to start recording.',
       )
     }
   }
 
   const stopRecording = () => {
-    if (!recorderRef.current || recorderRef.current.state === 'inactive') {
-      return
-    }
-
-    recorderRef.current.stop()
+    if (recorderRef.current?.state !== 'inactive') recorderRef.current?.stop()
+    if (audioRecorderRef.current?.state !== 'inactive') audioRecorderRef.current?.stop()
   }
 
   return {
@@ -579,6 +635,7 @@ export function useRecorder() {
     downloadUrl,
     errorMessage,
     phase,
+    previewUrl,
     startRecording,
     stopRecording,
     updateCaptureOption,

@@ -21,9 +21,13 @@ jobs:
 
           python3 - <<'PY'
           import os
+          import base64
           from pathlib import Path
 
-          key = os.environ["EC2_KEY"].replace("\\n", "\n").replace("\r", "")
+          key = os.environ["EC2_KEY"].strip().replace("\\n", "\n").replace("\r", "")
+          if "BEGIN OPENSSH PRIVATE KEY" not in key and "BEGIN RSA PRIVATE KEY" not in key and "BEGIN PRIVATE KEY" not in key:
+              key = base64.b64decode(key).decode()
+
           key_path = Path.home() / ".ssh" / "key.pem"
           key_path.write_text(key)
           key_path.chmod(0o600)
@@ -48,9 +52,8 @@ jobs:
           git pull origin main
 
           echo "Building and restarting containers..."
-          cd infra
 
-          docker compose -f docker-compose.prod.yaml up -d --build
+          docker compose -f infra/docker-compose.prod.yaml up -d --build
 
           echo "Cleaning unused Docker resources..."
           docker system prune -f

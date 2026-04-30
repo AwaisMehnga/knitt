@@ -1,66 +1,45 @@
-const express = require("express");
-const cors = require("cors");
+import "dotenv/config";
+import mongoose from "mongoose";
 
-const app = express();
+import app from "./src/app.js";
+import connectDB from "./src/config/db.js";
 
-const PORT = Number(process.env.PORT) || 5000;
-const HOST = process.env.HOST || "127.0.0.1";
-const DISPLAY_HOST = HOST === "0.0.0.0" ? "localhost" : HOST;
+const PORT = process.env.PORT || 5000;
 
-app.use(cors());
-app.use(express.json());
+const startServer = async () => {
+  try {
+    await connectDB();
 
-app.get("/", (req, res) => {
-	res.json({
-		ok: true,
-		service: "knitt-backend",
-		message: "Server is running",
-		timestamp: new Date().toISOString(),
-	});
-});
+    const server = app.listen(PORT, "0.0.0.0", () => {
+      console.log(`Server is running on port ${PORT}`);
+    });
 
-app.get("/health", (req, res) => {
-	res.status(200).json({ status: "healthy" });
-});
+    // shut down gracefully on SIGINT and SIGTERM
+    const shutdown = async (signal) => {
+      console.log(`Received ${signal}. Closing server...`);
+      server.close(async () => {
+        console.log("HTTP server closed");
 
-app.get("/api/startup", (req, res) => {
-	res.json({
-		startup: "success",
-		env: process.env.NODE_ENV || "development",
-	});
-});
+        // shutdown MongoDB connection
+        try {
+          await mongoose.connection.close();
+          console.log("MongoDB connection closed");
+        } catch (error) {
+          console.error("Error closing MongoDB connection:", error);
+        }
 
-app.use((req, res) => {
-	res.status(404).json({
-		ok: false,
-		error: "Route not found",
-	});
-});
+        process.exit(0);
+      });
+    };
 
-app.use((err, req, res, next) => {
-	console.error("Unhandled error:", err);
-	res.status(500).json({
-		ok: false,
-		error: "Internal server error",
-	});
-});
+    // register shutdown handlers
+    process.on("SIGINT", shutdown);
+    process.on("SIGTERM", shutdown);
+  } catch (error) {
+    console.error("Startup error:", error);
+    process.exit(1);
+  }
+};
 
-const server = app.listen(PORT, HOST, () => {
-	console.log(`Server started on http://${DISPLAY_HOST}:${PORT}`);
-});
 
-function shutdown(signal) {
-	console.log(`${signal} received. Shutting down gracefully...`);
-	server.close(() => {
-		console.log("HTTP server closed.");
-		process.exit(0);
-	});
-
-	setTimeout(() => {
-		console.error("Forcing shutdown after timeout.");
-		process.exit(1);
-	}, 10000).unref();
-}
-
-process.on("SIGINT", () => shutdown("SIGINT"));
-process.on("SIGTERM", () => shutdown("SIGTERM"));
+startServer();

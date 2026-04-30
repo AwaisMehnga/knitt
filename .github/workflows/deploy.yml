@@ -19,39 +19,20 @@ jobs:
         run: |
           mkdir -p ~/.ssh
 
-          python3 - <<'PY'
-          import os
-          import base64
-          import binascii
-          from pathlib import Path
+          # write private key safely
+          echo "$EC2_KEY" | tr -d '\r' > ~/.ssh/key.pem
+          chmod 600 ~/.ssh/key.pem
 
-          key = os.environ["EC2_KEY"].strip().replace("\\n", "\n").replace("\r", "")
-          pem_markers = ("BEGIN OPENSSH PRIVATE KEY", "BEGIN RSA PRIVATE KEY", "BEGIN PRIVATE KEY")
+          # verify key is valid (fails fast if corrupted)
+          ssh-keygen -y -f ~/.ssh/key.pem > /dev/null
 
-          if not any(marker in key for marker in pem_markers):
-            try:
-              key = base64.b64decode(key, validate=True).decode("utf-8")
-            except (binascii.Error, UnicodeDecodeError):
-              raise SystemExit(
-                "EC2_KEY must contain the EC2 private key, not the public key. "
-                "Paste ~/.ssh/id_ed25519 (or a base64-encoded copy of it), not id_ed25519.pub."
-              )
-
-          if not any(marker in key for marker in pem_markers):
-            raise SystemExit(
-              "EC2_KEY did not decode to a valid private key. "
-              "Verify the secret starts with BEGIN OPENSSH PRIVATE KEY or BEGIN PRIVATE KEY."
-            )
-
-          key_path = Path.home() / ".ssh" / "key.pem"
-          key_path.write_text(key)
-          key_path.chmod(0o600)
-          PY
-
-          ssh-keygen -y -f ~/.ssh/key.pem >/dev/null
-
-          # prevent host prompt issues
+          # add EC2 host to known hosts
           ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Test SSH connection
+        run: |
+          ssh -o StrictHostKeyChecking=no -i ~/.ssh/key.pem \
+            ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "echo SSH connection successful"
 
       - name: Deploy to EC2
         run: |
@@ -67,7 +48,6 @@ jobs:
           git pull origin main
 
           echo "Building and restarting containers..."
-
           docker compose -f infra/docker-compose.prod.yaml up -d --build
 
           echo "Cleaning unused Docker resources..."

@@ -22,11 +22,26 @@ jobs:
           python3 - <<'PY'
           import os
           import base64
+          import binascii
           from pathlib import Path
 
           key = os.environ["EC2_KEY"].strip().replace("\\n", "\n").replace("\r", "")
-          if "BEGIN OPENSSH PRIVATE KEY" not in key and "BEGIN RSA PRIVATE KEY" not in key and "BEGIN PRIVATE KEY" not in key:
-              key = base64.b64decode(key).decode()
+          pem_markers = ("BEGIN OPENSSH PRIVATE KEY", "BEGIN RSA PRIVATE KEY", "BEGIN PRIVATE KEY")
+
+          if not any(marker in key for marker in pem_markers):
+            try:
+              key = base64.b64decode(key, validate=True).decode("utf-8")
+            except (binascii.Error, UnicodeDecodeError):
+              raise SystemExit(
+                "EC2_KEY must contain the EC2 private key, not the public key. "
+                "Paste ~/.ssh/id_ed25519 (or a base64-encoded copy of it), not id_ed25519.pub."
+              )
+
+          if not any(marker in key for marker in pem_markers):
+            raise SystemExit(
+              "EC2_KEY did not decode to a valid private key. "
+              "Verify the secret starts with BEGIN OPENSSH PRIVATE KEY or BEGIN PRIVATE KEY."
+            )
 
           key_path = Path.home() / ".ssh" / "key.pem"
           key_path.write_text(key)

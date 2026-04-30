@@ -14,13 +14,22 @@ jobs:
         uses: actions/checkout@v3
 
       - name: Setup SSH key
+        env:
+          EC2_KEY: ${{ secrets.EC2_KEY }}
         run: |
           mkdir -p ~/.ssh
 
-          # IMPORTANT: preserve multiline key correctly
-          printf "%s" "${{ secrets.EC2_KEY }}" > ~/.ssh/key.pem
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
 
-          chmod 600 ~/.ssh/key.pem
+          key = os.environ["EC2_KEY"].replace("\\n", "\n").replace("\r", "")
+          key_path = Path.home() / ".ssh" / "key.pem"
+          key_path.write_text(key)
+          key_path.chmod(0o600)
+          PY
+
+          ssh-keygen -y -f ~/.ssh/key.pem >/dev/null
 
           # prevent host prompt issues
           ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
@@ -41,7 +50,7 @@ jobs:
           echo "Building and restarting containers..."
           cd infra
 
-          docker-compose -f docker-compose.prod.yml up -d --build
+          docker compose -f docker-compose.prod.yaml up -d --build
 
           echo "Cleaning unused Docker resources..."
           docker system prune -f

@@ -42,7 +42,7 @@ jobs:
 
           echo "=== Deployment started ==="
 
-          cd /app/knitt
+          cd ~/apps/knitt
 
           echo "Pulling latest code..."
           git pull origin main

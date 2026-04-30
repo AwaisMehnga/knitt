@@ -1,18 +1,13 @@
-FROM node:24-alpine AS build
+FROM node:24-alpine
 
 WORKDIR /app
 RUN corepack enable
 
 COPY package.json pnpm-lock.yaml ./
-RUN pnpm install
+RUN pnpm install --frozen-lockfile
 
 COPY . .
-RUN pnpm build
 
-FROM nginx:alpine
+EXPOSE 5000
 
-COPY --from=build /app/dist /usr/share/nginx/html
-
-EXPOSE 80
-
-CMD ["nginx", "-g", "daemon off;"]
+CMD ["npm", "run", "start"]

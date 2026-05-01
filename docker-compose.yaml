@@ -18,10 +18,8 @@ services:
     volumes:
       - ./backend:/app
       - /app/node_modules
-    environment:
-      - NODE_ENV=development
-      - HOST=0.0.0.0
-      - MONGO_URI=mongodb://mongo:27017/knitt
+    env_file:
+      - ./backend/.env
     command: npm run dev
     depends_on:
        - mongo
@@ -31,5 +29,18 @@ services:
       - "27017:27017"
     volumes:
       - mongo-data:/data/db
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=mehnga
+      - MONGO_INITDB_ROOT_PASSWORD=AwaisKnitt5+2=7
+  mongo-express:
+    image: mongo-express:latest
+    ports:
+      - "8085:8081"
+    environment:
+      - ME_CONFIG_MONGODB_URL=mongodb://mehnga:AwaisKnitt5+2=7@mongo:27017/?authSource=admin
+      - ME_CONFIG_BASICAUTH_USERNAME=mehnga
+      - ME_CONFIG_BASICAUTH_PASSWORD=AwaisKnitt5+2=7
+    depends_on:
+      - mongo
 volumes:
   mongo-data:

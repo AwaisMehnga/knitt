@@ -1,3 +1,5 @@
+import mongoose from "mongoose";
+
 const sessionSchema = new mongoose.Schema(
   {
     userId: {
@@ -27,6 +29,12 @@ const sessionSchema = new mongoose.Schema(
       type: Date,
       required: true,
       index: true,
+    },
+
+    jti: {
+      type: String,
+      required: true,
+      unique: true,
     },
 
     revokedAt: {

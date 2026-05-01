@@ -1,3 +1,5 @@
+import mongoose from "mongoose";
+
 const oauthAccountSchema = new mongoose.Schema(
   {
     userId: {
@@ -27,6 +29,7 @@ const oauthAccountSchema = new mongoose.Schema(
     refreshToken: {
       type: String,
       required: true,
+      unique: true,
     },
 
     scope: {

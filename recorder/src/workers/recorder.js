@@ -26,6 +26,8 @@ class WorkerRecorder {
       audioBitrate: options?.audioBitrate || 128_000,
       debug: Boolean(options?.debug),
     };
+    this.opfsWriteChain = Promise.resolve();
+    this.opfsWriteFailed = false;
 
     this.running = false;
     this.startedAtUs = null;
@@ -58,7 +60,11 @@ class WorkerRecorder {
     this.enableAudio = false;
     this.selectedAudioMuxerCodec = null;
 
+    // OPFS storage
     this.chunks = [];
+    this.opfsFileHandle = null;
+    this.opfsWritableStream = null;
+    this.useOPFS = true;
   }
 
   log(...args) {
@@ -73,12 +79,131 @@ class WorkerRecorder {
     }
   }
 
+  async initializeOPFS() {
+    try {
+      if (!navigator.storage?.getDirectory) {
+        this.warn("[WorkerRecorder] OPFS not available, falling back to RAM");
+        this.useOPFS = false;
+        return;
+      }
+
+      const root = await navigator.storage.getDirectory();
+      const fileName = `recording-${Date.now()}.mp4.tmp`;
+      this.opfsFileHandle = await root.getFileHandle(fileName, { create: true });
+      this.opfsWritableStream = await this.opfsFileHandle.createWritable();
+      this.log("[WorkerRecorder] OPFS initialized with file:", fileName);
+    } catch (error) {
+      this.warn("[WorkerRecorder] OPFS initialization failed", error);
+      this.useOPFS = false;
+    }
+  }
+
+  async writeChunkToOPFS(chunk) {
+    if (!this.useOPFS || !this.opfsWritableStream) return;
+    try {
+      await this.opfsWritableStream.write(chunk);
+    } catch (error) {
+      this.warn("[WorkerRecorder] failed to write chunk to OPFS", error);
+      this.useOPFS = false;
+      this.opfsWriteFailed = true;
+      this.chunks.push(chunk);
+    }
+  }
+
+  enqueueOPFSWrite(chunk) {
+    if (!this.useOPFS || !this.opfsWritableStream) {
+      this.chunks.push(chunk);
+      return;
+    }
+
+    // Serialize file writes off the hot path to reduce encode-loop stalls.
+    this.opfsWriteChain = this.opfsWriteChain
+      .catch(() => {})
+      .then(async () => {
+        await this.writeChunkToOPFS(chunk);
+      });
+  }
+
+  async waitForOPFSWrites() {
+    try {
+      await this.opfsWriteChain;
+    } catch (error) {
+      this.warn("[WorkerRecorder] waiting for OPFS writes failed", error);
+      this.opfsWriteFailed = true;
+    }
+  }
+
+  async flushOPFSStream() {
+    if (!this.useOPFS || !this.opfsWritableStream) return;
+    try {
+      await this.opfsWritableStream.flush?.();
+      this.log("[WorkerRecorder] OPFS stream flushed");
+    } catch (error) {
+      this.warn("[WorkerRecorder] failed to flush OPFS stream", error);
+    }
+  }
+
+  async readChunksFromOPFS() {
+    if (!this.useOPFS || !this.opfsFileHandle) return null;
+    try {
+      // Flush and close the writable stream before reading
+      if (this.opfsWritableStream) {
+        try {
+          await this.opfsWritableStream.flush?.();
+          await this.opfsWritableStream.close();
+          this.opfsWritableStream = null;
+          this.log("[WorkerRecorder] OPFS writable stream closed for reading");
+        } catch (error) {
+          this.warn("[WorkerRecorder] error closing writable stream", error);
+        }
+      }
+
+      // Now read the file
+      const file = await this.opfsFileHandle.getFile();
+      const arrayBuffer = await file.arrayBuffer();
+      this.log("[WorkerRecorder] read from OPFS", { size: arrayBuffer.byteLength });
+      return arrayBuffer;
+    } catch (error) {
+      this.warn("[WorkerRecorder] failed to read from OPFS", error);
+      return null;
+    }
+  }
+
+  async cleanupOPFS() {
+    try {
+      if (this.opfsWritableStream) {
+        try {
+          await this.opfsWritableStream.close();
+        } catch (error) {
+          this.log("[WorkerRecorder] writable stream already closed or error closing");
+        }
+        this.opfsWritableStream = null;
+      }
+
+      if (this.opfsFileHandle) {
+        try {
+          const root = await navigator.storage.getDirectory();
+          await root.removeEntry(this.opfsFileHandle.name);
+          this.log("[WorkerRecorder] OPFS temp file deleted:", this.opfsFileHandle.name);
+        } catch (error) {
+          this.warn("[WorkerRecorder] could not delete OPFS temp file", error);
+        }
+        this.opfsFileHandle = null;
+      }
+    } catch (error) {
+      this.warn("[WorkerRecorder] OPFS cleanup error", error);
+    }
+  }
+
   async start() {
     if (!this.screenReadable) {
       throw new Error("No screen video readable received by worker");
     }
 
     this.running = true;
+
+    // Initialize OPFS before starting encoding
+    await this.initializeOPFS();
 
     this.screenReader = this.screenReadable.getReader();
     const probe = await this.primeVideoReader(this.screenReader, "latestScreenFrame");
@@ -117,8 +242,8 @@ class WorkerRecorder {
       audioBitrate: this.options.audioBitrate,
       videoCodec: "avc",
       audioCodec: this.enableAudio ? this.selectedAudioMuxerCodec : undefined,
-      onChunk: (chunk) => {
-        this.chunks.push(chunk);
+      onChunk: async (chunk) => {
+        this.enqueueOPFSWrite(chunk);
       },
       debug: this.options.debug,
     });
@@ -248,6 +373,7 @@ class WorkerRecorder {
       audioChunksEncoded: this.audioChunksEncoded,
       audioSamplesWritten: this.audioSamplesWritten,
       audioSampleRate: this.audioSampleRate,
+      useOPFS: this.useOPFS,
     });
 
     try {
@@ -260,13 +386,37 @@ class WorkerRecorder {
     } catch (error) {
       await this.muxer.flushPending();
       throw error;
-    } finally {
-      this.cleanup();
     }
 
-    const blob = new Blob(this.chunks, {
-      type: "video/mp4",
-    });
+    // Read from OPFS BEFORE calling cleanup (which deletes the file)
+    let blob;
+
+    await this.waitForOPFSWrites();
+    
+    if (this.useOPFS) {
+      const opfsData = await this.readChunksFromOPFS();
+      if (opfsData && opfsData.byteLength > 0) {
+        blob = new Blob([opfsData], { type: "video/mp4" });
+        this.log("[WorkerRecorder] created blob from OPFS", {
+          size: blob.size,
+          opfsDataSize: opfsData.byteLength,
+        });
+      } else {
+        // Fallback to RAM chunks if OPFS read failed or empty
+        this.warn("[WorkerRecorder] OPFS data empty or failed, falling back to RAM");
+        blob = new Blob(this.chunks, { type: "video/mp4" });
+        this.log("[WorkerRecorder] created blob from RAM chunks", {
+          size: blob.size,
+          chunksCount: this.chunks.length,
+        });
+      }
+    } else {
+      blob = new Blob(this.chunks, { type: "video/mp4" });
+      this.log("[WorkerRecorder] created blob from RAM");
+    }
+
+    // Now cleanup resources (including deleting OPFS file)
+    this.cleanup();
 
     postMessage({
       type: "stopped",
@@ -640,6 +790,13 @@ class WorkerRecorder {
     this.muxer = null;
     this.enableAudio = false;
     this.selectedAudioMuxerCodec = null;
+
+    // Cleanup OPFS resources (async, so we don't await here)
+    this.cleanupOPFS().catch((error) => {
+      this.warn("[WorkerRecorder] error during OPFS cleanup", error);
+    });
+    this.opfsWriteChain = Promise.resolve();
+    this.opfsWriteFailed = false;
   }
 
   delay(ms) {

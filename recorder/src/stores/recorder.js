@@ -2,8 +2,8 @@ import { create } from "zustand";
 import { getBitrates, getResolutionForQuality } from "../utils/recorderConfig";
 import { getUserMediaWithFallback } from "../utils/mediaDeviceFallback";
 
-const DEFAULT_QUALITY = "1080p";
-const DEFAULT_FPS = 30;
+const DEFAULT_QUALITY = "4k";
+const DEFAULT_FPS = 60;
 
 const createRecorderWorker = () =>
   new Worker(new URL("../workers/recorder.js", import.meta.url), {
@@ -51,6 +51,25 @@ const createTrackReadable = (track) => {
   return {
     processor,
     readable: processor.readable,
+  };
+};
+
+const getCaptureProfile = () => {
+  const cores = Number(navigator.hardwareConcurrency || 0);
+  const memory = Number(navigator.deviceMemory || 0);
+  const highEnd = cores >= 8 && memory >= 8;
+
+  if (highEnd) {
+    return {
+      quality: DEFAULT_QUALITY,
+      fps: DEFAULT_FPS,
+    };
+  }
+
+  // Keep recording smooth on low-end devices.
+  return {
+    quality: "1080p",
+    fps: 30,
   };
 };
 
@@ -121,6 +140,7 @@ export const useRecorderStore = create((set, get) => ({
   worker: null,
   displayStream: null,
   cameraStream: null,
+  micStream: null,
   audioContext: null,
   audioGraph: null,
   mixedAudioTrack: null,
@@ -143,16 +163,18 @@ export const useRecorderStore = create((set, get) => ({
 
     let displayStream = null;
     let cameraStream = null;
+    let micStream = null;
     let worker = null;
     let audioGraph = null;
 
     try {
-      const quality = getResolutionForQuality(DEFAULT_QUALITY);
-      const bitrates = getBitrates(DEFAULT_QUALITY);
+      const profile = getCaptureProfile();
+      const quality = getResolutionForQuality(profile.quality);
+      const bitrates = getBitrates(profile.quality);
 
       displayStream = await navigator.mediaDevices.getDisplayMedia({
         video: {
-          frameRate: { ideal: DEFAULT_FPS, max: DEFAULT_FPS },
+          frameRate: { ideal: profile.fps, max: profile.fps },
           width: { ideal: quality.width },
           height: { ideal: quality.height },
         },
@@ -162,10 +184,17 @@ export const useRecorderStore = create((set, get) => ({
       cameraStream = await getUserMediaWithFallback({
         constraints: {
           video: {
-            width: { ideal: 1280 },
-            height: { ideal: 720 },
-            frameRate: { ideal: DEFAULT_FPS, max: DEFAULT_FPS },
+            width: { ideal: 1920 },
+            height: { ideal: 1080 },
+            frameRate: { ideal: profile.fps, max: profile.fps },
           },
+          audio: false,
+        },
+      });
+
+      micStream = await getUserMediaWithFallback({
+        constraints: {
+          video: false,
           audio: {
             echoCancellation: true,
             noiseSuppression: true,
@@ -176,7 +205,7 @@ export const useRecorderStore = create((set, get) => ({
 
       audioGraph = await createMixedAudioGraph({
         systemStream: displayStream,
-        micStream: cameraStream,
+        micStream,
       });
 
       worker = createRecorderWorker();
@@ -208,6 +237,7 @@ export const useRecorderStore = create((set, get) => ({
           await cleanupAudioGraph(audioGraph);
           stopStream(displayStream);
           stopStream(cameraStream);
+          stopStream(micStream);
           worker.terminate();
           const videoUrl = URL.createObjectURL(blob);
           set({
@@ -219,6 +249,7 @@ export const useRecorderStore = create((set, get) => ({
             worker: null,
             displayStream: null,
             cameraStream: null,
+            micStream: null,
             audioContext: null,
             audioGraph: null,
             mixedAudioTrack: null,
@@ -255,6 +286,7 @@ export const useRecorderStore = create((set, get) => ({
         worker,
         displayStream,
         cameraStream,
+        micStream,
         audioContext: audioGraph.audioContext,
         audioGraph,
         mixedAudioTrack,
@@ -276,7 +308,7 @@ export const useRecorderStore = create((set, get) => ({
             }
           : null,
         options: {
-          fps: DEFAULT_FPS,
+          fps: profile.fps,
           width: quality.width,
           height: quality.height,
           videoBitrate: bitrates.video,
@@ -299,6 +331,7 @@ export const useRecorderStore = create((set, get) => ({
       worker?.terminate();
       stopStream(displayStream);
       stopStream(cameraStream);
+      stopStream(micStream);
       await cleanupAudioGraph(audioGraph);
 
       set({
@@ -309,6 +342,7 @@ export const useRecorderStore = create((set, get) => ({
         worker: null,
         displayStream: null,
         cameraStream: null,
+        micStream: null,
         audioContext: null,
         audioGraph: null,
         mixedAudioTrack: null,
@@ -339,6 +373,7 @@ export const useRecorderStore = create((set, get) => ({
       worker,
       displayStream,
       cameraStream,
+      micStream,
       audioGraph,
     } = get();
 
@@ -346,11 +381,13 @@ export const useRecorderStore = create((set, get) => ({
     await cleanupAudioGraph(audioGraph);
     stopStream(displayStream);
     stopStream(cameraStream);
+    stopStream(micStream);
 
     set({
       worker: null,
       displayStream: null,
       cameraStream: null,
+      micStream: null,
       audioContext: null,
       audioGraph: null,
       mixedAudioTrack: null,

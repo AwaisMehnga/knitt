@@ -65,6 +65,10 @@ class WorkerRecorder {
     this.opfsFileHandle = null;
     this.opfsWritableStream = null;
     this.useOPFS = true;
+    // IndexedDB storage (fallback when OPFS unavailable)
+    this.idbDB = null;
+    this.idbStoreName = `recorder_chunks_${Date.now()}`;
+    this.idbWriteChain = Promise.resolve();
   }
 
   log(...args) {
@@ -83,6 +87,8 @@ class WorkerRecorder {
     try {
       if (!navigator.storage?.getDirectory) {
         this.useOPFS = false;
+        // Initialize IndexedDB fallback when OPFS not present
+        await this.initializeIndexedDB();
         return;
       }
 
@@ -93,6 +99,12 @@ class WorkerRecorder {
     } catch (error) {
       void error;
       this.useOPFS = false;
+      // Try to init IDB as fallback
+      try {
+        await this.initializeIndexedDB();
+      } catch (e) {
+        void e;
+      }
     }
   }
 
@@ -109,22 +121,29 @@ class WorkerRecorder {
   }
 
   enqueueOPFSWrite(chunk) {
-    if (!this.useOPFS || !this.opfsWritableStream) {
-      this.chunks.push(chunk);
+    if (this.useOPFS && this.opfsWritableStream) {
+      // Serialize file writes off the hot path to reduce encode-loop stalls.
+      this.opfsWriteChain = this.opfsWriteChain
+        .catch(() => {})
+        .then(async () => {
+          await this.writeChunkToOPFS(chunk);
+        });
       return;
     }
 
-    // Serialize file writes off the hot path to reduce encode-loop stalls.
-    this.opfsWriteChain = this.opfsWriteChain
-      .catch(() => {})
-      .then(async () => {
-        await this.writeChunkToOPFS(chunk);
-      });
+    // If OPFS is not available, try IndexedDB write chain; otherwise keep in-memory
+    if (this.idbDB) {
+      this.enqueueIDBWrite(chunk);
+      return;
+    }
+
+    this.chunks.push(chunk);
   }
 
   async waitForOPFSWrites() {
     try {
       await this.opfsWriteChain;
+      await this.idbWriteChain;
     } catch (error) {
       void error;
       this.opfsWriteFailed = true;
@@ -141,26 +160,152 @@ class WorkerRecorder {
   }
 
   async readChunksFromOPFS() {
-    if (!this.useOPFS || !this.opfsFileHandle) return null;
+    if (this.useOPFS && this.opfsFileHandle) {
+      try {
+        // Flush and close the writable stream before reading
+        if (this.opfsWritableStream) {
+          try {
+            await this.opfsWritableStream.flush?.();
+            await this.opfsWritableStream.close();
+            this.opfsWritableStream = null;
+          } catch (error) {
+            void error;
+          }
+        }
+
+        // Now read the file
+        const file = await this.opfsFileHandle.getFile();
+        const arrayBuffer = await file.arrayBuffer();
+        return arrayBuffer;
+      } catch (error) {
+        void error;
+        return null;
+      }
+    }
+
+    // If using IndexedDB fallback, read from IDB
+    if (this.idbDB) {
+      try {
+        const arr = await this.readChunksFromIDB();
+        if (!arr || arr.length === 0) return null;
+        // Concatenate into single ArrayBuffer
+        const total = arr.reduce((s, b) => s + b.byteLength, 0);
+        const out = new Uint8Array(total);
+        let offset = 0;
+        for (const buf of arr) {
+          out.set(new Uint8Array(buf), offset);
+          offset += buf.byteLength;
+        }
+        return out.buffer;
+      } catch (error) {
+        void error;
+        return null;
+      }
+    }
+
+    return null;
+  }
+
+  /* IndexedDB fallback helpers */
+  async initializeIndexedDB() {
+    if (!self.indexedDB) return;
+
+    return new Promise((resolve, reject) => {
+      try {
+        const req = indexedDB.open(this.idbStoreName, 1);
+        req.onupgradeneeded = (ev) => {
+          const db = ev.target.result;
+          if (!db.objectStoreNames.contains("chunks")) {
+            db.createObjectStore("chunks", { autoIncrement: true });
+          }
+        };
+        req.onsuccess = (ev) => {
+          this.idbDB = ev.target.result;
+          resolve();
+        };
+        req.onerror = (ev) => {
+          reject(ev.target.error);
+        };
+      } catch (error) {
+        reject(error);
+      }
+    });
+  }
+
+  async writeChunkToIDB(chunk) {
+    if (!this.idbDB) throw new Error("IDB not initialized");
+    return new Promise((resolve, reject) => {
+      try {
+        const tx = this.idbDB.transaction(["chunks"], "readwrite");
+        const store = tx.objectStore("chunks");
+        const request = store.add(chunk);
+        request.onsuccess = () => resolve();
+        request.onerror = (ev) => reject(ev.target.error);
+      } catch (error) {
+        reject(error);
+      }
+    });
+  }
+
+  enqueueIDBWrite(chunk) {
+    if (!this.idbDB) {
+      this.chunks.push(chunk);
+      return;
+    }
+
+    this.idbWriteChain = this.idbWriteChain
+      .catch(() => {})
+      .then(async () => {
+        await this.writeChunkToIDB(chunk);
+      });
+  }
+
+  async waitForIDBWrites() {
     try {
-      // Flush and close the writable stream before reading
-      if (this.opfsWritableStream) {
+      await this.idbWriteChain;
+    } catch (error) {
+      void error;
+    }
+  }
+
+  async readChunksFromIDB() {
+    if (!this.idbDB) return [];
+    return new Promise((resolve, reject) => {
+      try {
+        const tx = this.idbDB.transaction(["chunks"], "readonly");
+        const store = tx.objectStore("chunks");
+        const req = store.getAll();
+        req.onsuccess = (ev) => {
+          resolve(ev.target.result || []);
+        };
+        req.onerror = (ev) => reject(ev.target.error);
+      } catch (error) {
+        reject(error);
+      }
+    });
+  }
+
+  async cleanupIDB() {
+    try {
+      if (this.idbDB) {
         try {
-          await this.opfsWritableStream.flush?.();
-          await this.opfsWritableStream.close();
-          this.opfsWritableStream = null;
+          this.idbDB.close();
+        } catch (error) {
+          void error;
+        }
+        // Best-effort: delete DB entirely to free storage
+        try {
+          const name = this.idbDB.name;
+          this.idbDB = null;
+          const delReq = indexedDB.deleteDatabase(name);
+          delReq.onsuccess = () => {};
+          delReq.onerror = () => {};
         } catch (error) {
           void error;
         }
       }
-
-      // Now read the file
-      const file = await this.opfsFileHandle.getFile();
-      const arrayBuffer = await file.arrayBuffer();
-      return arrayBuffer;
     } catch (error) {
       void error;
-      return null;
     }
   }
 
@@ -744,8 +889,13 @@ class WorkerRecorder {
     this.cleanupOPFS().catch((error) => {
       void error;
     });
+    // Cleanup IndexedDB resources
+    this.cleanupIDB().catch((error) => {
+      void error;
+    });
     this.opfsWriteChain = Promise.resolve();
     this.opfsWriteFailed = false;
+    this.idbWriteChain = Promise.resolve();
   }
 
   delay(ms) {

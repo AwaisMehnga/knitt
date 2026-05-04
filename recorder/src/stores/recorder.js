@@ -150,6 +150,13 @@ export const useRecorderStore = create((set, get) => ({
   videoUrl: null,
   blob: null,
   worker: null,
+  mediaRecorder: null,
+  fallbackDB: null,
+  useMediaRecorderFallback: false,
+  chunks: [],
+  capabilities: null,
+  recordCamera: false,
+  recordMic: true,
   displayStream: null,
   cameraStream: null,
   micStream: null,
@@ -180,6 +187,18 @@ export const useRecorderStore = create((set, get) => ({
     let audioGraph = null;
 
     try {
+      // Runtime capability detection
+      const capabilities = {
+        opfs: Boolean(navigator.storage?.getDirectory),
+        idb: typeof indexedDB !== "undefined",
+        webcodecs:
+          typeof window.VideoEncoder !== "undefined" &&
+          typeof window.AudioEncoder !== "undefined" &&
+          typeof window.MediaStreamTrackProcessor !== "undefined",
+      };
+
+      // Expose capabilities in state for UI
+      set({ capabilities });
       const profile = getCaptureProfile();
       const quality = getResolutionForQuality(profile.quality);
       const bitrates = getBitrates(profile.quality);
@@ -204,36 +223,118 @@ export const useRecorderStore = create((set, get) => ({
         fps: targetFps,
       });
 
-      cameraStream = await getUserMediaWithFallback({
-        constraints: {
-          video: {
-            width: { ideal: 1920 },
-            height: { ideal: 1080 },
-            frameRate: { ideal: profile.fps, max: profile.fps },
+      // Conditionally acquire camera stream based on user selection
+      if (get().recordCamera) {
+        cameraStream = await getUserMediaWithFallback({
+          constraints: {
+            video: {
+              width: { ideal: 1920 },
+              height: { ideal: 1080 },
+              frameRate: { ideal: profile.fps, max: profile.fps },
+            },
+            audio: false,
           },
-          audio: false,
-        },
-      });
+        });
+      }
 
-      micStream = await getUserMediaWithFallback({
-        constraints: {
-          video: false,
-          audio: {
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true,
-          },
-        },
-      });
+      // Conditionally acquire mic stream based on user selection
+      if (get().recordMic) {
+        try {
+          micStream = await getUserMediaWithFallback({
+            constraints: {
+              video: false,
+              audio: {
+                echoCancellation: true,
+                noiseSuppression: true,
+                autoGainControl: true,
+              },
+            },
+          });
+        } catch (err) {
+          micStream = null;
+        }
+      }
 
       audioGraph = await createMixedAudioGraph({
         systemStream: displayStream,
         micStream,
       });
 
-      worker = createRecorderWorker();
+      // If WebCodecs not available, use MediaRecorder fallback that writes chunks to IndexedDB
+      let useMediaRecorderFallback = !capabilities.webcodecs;
 
-      worker.onerror = (event) => {
+      worker = null;
+      let mediaRecorder = null;
+      let fallbackDB = null;
+      const fallbackStoreName = `mr_chunks_${Date.now()}`;
+
+      // Helpers for IndexedDB in main thread (used by MediaRecorder fallback)
+      const openIdb = (name) =>
+        new Promise((resolve, reject) => {
+          try {
+            const req = indexedDB.open(name, 1);
+            req.onupgradeneeded = (ev) => {
+              const db = ev.target.result;
+              if (!db.objectStoreNames.contains("chunks")) {
+                db.createObjectStore("chunks", { autoIncrement: true });
+              }
+            };
+            req.onsuccess = (ev) => resolve(ev.target.result);
+            req.onerror = (ev) => reject(ev.target.error);
+          } catch (error) {
+            reject(error);
+          }
+        });
+
+      const addChunkToIdb = (db, chunk) =>
+        new Promise((resolve, reject) => {
+          try {
+            const tx = db.transaction(["chunks"], "readwrite");
+            const store = tx.objectStore("chunks");
+            const req = store.add(chunk);
+            req.onsuccess = () => resolve();
+            req.onerror = (ev) => reject(ev.target.error);
+          } catch (error) {
+            reject(error);
+          }
+        });
+
+      const readAllFromIdb = (db) =>
+        new Promise((resolve, reject) => {
+          try {
+            const tx = db.transaction(["chunks"], "readonly");
+            const store = tx.objectStore("chunks");
+            const req = store.getAll();
+            req.onsuccess = (ev) => resolve(ev.target.result || []);
+            req.onerror = (ev) => reject(ev.target.error);
+          } catch (error) {
+            reject(error);
+          }
+        });
+
+      const deleteIdb = (db) => {
+        try {
+          const name = db.name;
+          db.close();
+          indexedDB.deleteDatabase(name);
+        } catch (e) {
+          void e;
+        }
+      };
+
+      if (useMediaRecorderFallback) {
+        // Prepare MediaRecorder fallback: record display video + mixed audio (no PiP)
+        try {
+          fallbackDB = await openIdb(fallbackStoreName);
+        } catch (err) {
+          fallbackDB = null;
+        }
+      } else {
+        worker = createRecorderWorker();
+      }
+
+      if (worker) {
+        worker.onerror = (event) => {
         get().cleanup();
         set({
           isRecording: false,
@@ -244,7 +345,7 @@ export const useRecorderStore = create((set, get) => ({
         });
       };
 
-      worker.onmessage = async (event) => {
+        worker.onmessage = async (event) => {
         const { type, blob, error } = event.data || {};
 
         if (type === "started") {
@@ -290,9 +391,71 @@ export const useRecorderStore = create((set, get) => ({
             worker: null,
           });
         }
-      };
+        };
+      }
 
-      const cameraVideoTrack = cameraStream.getVideoTracks()[0] || null;
+      if (useMediaRecorderFallback) {
+        // Start MediaRecorder on a composed stream: display video + mixed audio
+        const mixedAudioTrack = audioGraph.mixedTrack || null;
+        const mrStream = new MediaStream();
+        const displayTrack = displayStream.getVideoTracks()[0];
+        if (displayTrack) mrStream.addTrack(displayTrack);
+        if (mixedAudioTrack) mrStream.addTrack(mixedAudioTrack);
+
+        const mimeCandidates = [
+          "video/webm;codecs=vp9,opus",
+          "video/webm;codecs=vp8,opus",
+          "video/webm",
+        ];
+        let mimeType = "video/webm";
+        for (const c of mimeCandidates) {
+          if (MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(c)) {
+            mimeType = c;
+            break;
+          }
+        }
+
+        try {
+          mediaRecorder = new MediaRecorder(mrStream, { mimeType });
+        } catch (err) {
+          mediaRecorder = null;
+        }
+
+        if (!mediaRecorder) {
+          throw new Error("No suitable MediaRecorder available for fallback");
+        }
+
+        mediaRecorder.ondataavailable = async (ev) => {
+          try {
+            const data = ev.data;
+            if (fallbackDB && data && data.size > 0) {
+              const arrayBuffer = await data.arrayBuffer();
+              await addChunkToIdb(fallbackDB, arrayBuffer);
+            } else if (data && data.size > 0) {
+              // If IDB not available, keep in memory
+              get().chunks?.push(data);
+            }
+          } catch (e) {
+            void e;
+          }
+        };
+
+        mediaRecorder.onstart = () => {
+          set({ isRecording: true, isStarting: false, status: "recording", worker: null });
+        };
+
+        mediaRecorder.onerror = (ev) => {
+          get().cleanup();
+          set({ isRecording: false, isStarting: false, status: "error", error: ev?.error?.message || "MediaRecorder error" });
+        };
+
+        // Start with 1s timeslices to produce frequent chunks
+        mediaRecorder.start(1000);
+        // Store reference for stop
+        set({ mediaRecorder, fallbackDB, useMediaRecorderFallback: true, worker: null });
+      }
+
+      const cameraVideoTrack = cameraStream?.getVideoTracks()[0] || null;
       const mixedAudioTrack = audioGraph.mixedTrack || null;
       const screenVideoReadable = createTrackReadable(displayVideoTrack);
       const cameraVideoReadable = createTrackReadable(cameraVideoTrack);
@@ -342,13 +505,15 @@ export const useRecorderStore = create((set, get) => ({
       if (cameraVideoReadable?.readable) transfer.push(cameraVideoReadable.readable);
       if (audioReadable?.readable) transfer.push(audioReadable.readable);
 
-      worker.postMessage(
-        {
-          type: "start",
-          payload,
-        },
-        transfer
-      );
+      if (worker) {
+        worker.postMessage(
+          {
+            type: "start",
+            payload,
+          },
+          transfer
+        );
+      }
     } catch (error) {
       worker?.terminate();
       stopStream(displayStream);
@@ -378,16 +543,80 @@ export const useRecorderStore = create((set, get) => ({
       isRecording,
       isStarting,
       status,
+      useMediaRecorderFallback,
+      mediaRecorder,
+      fallbackDB,
+      chunks,
     } = get();
-    if (!worker || (!isRecording && !isStarting) || status === "stopping") return;
+    if ((!worker && !useMediaRecorderFallback) || (!isRecording && !isStarting) || status === "stopping") return;
 
-    set({
-      status: "stopping",
-      isRecording: false,
-      isStarting: false,
-    });
+    set({ status: "stopping", isRecording: false, isStarting: false });
 
-    worker.postMessage({ type: "stop" });
+    if (useMediaRecorderFallback) {
+      // Stop MediaRecorder and assemble blob from IDB or memory
+      try {
+        if (mediaRecorder && mediaRecorder.state !== "inactive") {
+          mediaRecorder.stop();
+        }
+      } catch (e) {
+        void e;
+      }
+
+      // Wait briefly for final dataavailable events to flush
+      await new Promise((r) => setTimeout(r, 800));
+
+      try {
+        if (fallbackDB) {
+          const tx = fallbackDB.transaction(["chunks"], "readonly");
+          const store = tx.objectStore("chunks");
+          const req = store.getAll();
+          const arr = await new Promise((resolve, reject) => {
+            req.onsuccess = (ev) => resolve(ev.target.result || []);
+            req.onerror = (ev) => reject(ev.target.error);
+          });
+
+          if (arr && arr.length) {
+            const total = arr.reduce((s, b) => s + b.byteLength, 0);
+            const out = new Uint8Array(total);
+            let off = 0;
+            for (const buf of arr) {
+              out.set(new Uint8Array(buf), off);
+              off += buf.byteLength;
+            }
+            const blob = new Blob([out.buffer], { type: "video/webm" });
+            const videoUrl = URL.createObjectURL(blob);
+            // cleanup DB
+            try {
+              const name = fallbackDB.name;
+              fallbackDB.close();
+              indexedDB.deleteDatabase(name);
+            } catch (e) {
+              void e;
+            }
+            set({ isRecording: false, isStarting: false, status: "stopped", blob, videoUrl, mediaRecorder: null, fallbackDB: null, useMediaRecorderFallback: false });
+            return;
+          }
+        }
+
+        // Fallback to in-memory chunks if IDB not available
+        if (chunks && chunks.length) {
+          const blob = new Blob(chunks, { type: "video/webm" });
+          const videoUrl = URL.createObjectURL(blob);
+          set({ isRecording: false, isStarting: false, status: "stopped", blob, videoUrl, mediaRecorder: null, fallbackDB: null, useMediaRecorderFallback: false, chunks: [] });
+          return;
+        }
+      } catch (error) {
+        void error;
+      }
+
+      // If nothing produced
+      set({ isRecording: false, isStarting: false, status: "stopped", mediaRecorder: null, fallbackDB: null, useMediaRecorderFallback: false });
+      return;
+    }
+
+    if (worker) {
+      worker.postMessage({ type: "stop" });
+    }
   },
 
   cleanup: async () => {
@@ -397,7 +626,35 @@ export const useRecorderStore = create((set, get) => ({
       cameraStream,
       micStream,
       audioGraph,
+      mediaRecorder,
+      fallbackDB,
     } = get();
+
+    try {
+      if (mediaRecorder && mediaRecorder.state !== "inactive") {
+        try {
+          mediaRecorder.stop();
+        } catch (e) {
+          void e;
+        }
+      }
+    } catch (e) {
+      void e;
+    }
+
+    try {
+      if (fallbackDB) {
+        try {
+          const name = fallbackDB.name;
+          fallbackDB.close();
+          indexedDB.deleteDatabase(name);
+        } catch (e) {
+          void e;
+        }
+      }
+    } catch (e) {
+      void e;
+    }
 
     worker?.terminate();
     await cleanupAudioGraph(audioGraph);
@@ -407,12 +664,32 @@ export const useRecorderStore = create((set, get) => ({
 
     set({
       worker: null,
+      mediaRecorder: null,
+      fallbackDB: null,
+      useMediaRecorderFallback: false,
       displayStream: null,
       cameraStream: null,
       micStream: null,
       audioContext: null,
       audioGraph: null,
       mixedAudioTrack: null,
+      chunks: [],
     });
+  },
+
+  toggleRecordCamera: () => {
+    set({ recordCamera: !get().recordCamera });
+  },
+
+  toggleRecordMic: () => {
+    set({ recordMic: !get().recordMic });
+  },
+
+  setRecordCamera: (value) => {
+    set({ recordCamera: Boolean(value) });
+  },
+
+  setRecordMic: (value) => {
+    set({ recordMic: Boolean(value) });
   },
 }));

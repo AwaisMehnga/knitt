@@ -7,8 +7,12 @@ function App() {
     status,
     error,
     videoUrl,
+    recordCamera,
+    recordMic,
     startRecording,
     stopRecording,
+    toggleRecordCamera,
+    toggleRecordMic,
   } = useRecorderStore();
 
   return (
@@ -18,6 +22,37 @@ function App() {
         A tool to record your screen and webcam, and stitch them together into a
         single video.
       </p>
+
+      {/* Recording options - only show when not recording */}
+      {!isRecording && !isStarting && (
+        <div className="flex flex-col gap-4 mt-8 p-6 bg-gray-100 rounded-lg">
+          <div className="flex items-center gap-3">
+            <input
+              type="checkbox"
+              id="recordCamera"
+              checked={recordCamera}
+              onChange={toggleRecordCamera}
+              className="w-4 h-4 cursor-pointer"
+            />
+            <label htmlFor="recordCamera" className="cursor-pointer font-medium">
+              Record Camera (PiP overlay)
+            </label>
+          </div>
+          <div className="flex items-center gap-3">
+            <input
+              type="checkbox"
+              id="recordMic"
+              checked={recordMic}
+              onChange={toggleRecordMic}
+              className="w-4 h-4 cursor-pointer"
+            />
+            <label htmlFor="recordMic" className="cursor-pointer font-medium">
+              Record Microphone
+            </label>
+          </div>
+          <p className="text-sm text-gray-600">Full screen recording is always enabled</p>
+        </div>
+      )}
 
       <div className="flex items-center gap-4 mt-8">
         <button

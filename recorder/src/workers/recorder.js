@@ -1,4 +1,12 @@
-import { Mp4MuxerWrapper } from "../offline-recorder/recorder/webcodecs/Mp4MuxerWrapper.ts";
+import { Mp4MuxerWrapper } from "../utils/Mp4MuxerWrapper.ts";
+import { getEncodableAudioCodecs } from "mediabunny";
+
+// Maps mediabunny codec name → WebCodecs AudioEncoder codec strings to probe.
+// Ordered from highest to lowest quality within each family.
+const MUXER_CODEC_TO_WEBCODECS = {
+  aac: ["mp4a.40.2", "mp4a.40.5", "mp4a.40.29"],
+  opus: ["opus"],
+};
 
 const state = {
   controller: null,
@@ -27,6 +35,7 @@ class WorkerRecorder {
     this.lastKeyFrameIndex = 0;
     this.audioSamplesWritten = 0;
     this.audioSampleRate = 48_000;
+    this.audioChunksEncoded = 0;
 
     this.screenReader = null;
     this.cameraReader = null;
@@ -46,6 +55,8 @@ class WorkerRecorder {
     this.videoEncoder = null;
     this.audioEncoder = null;
     this.muxer = null;
+    this.enableAudio = false;
+    this.selectedAudioMuxerCodec = null;
 
     this.chunks = [];
   }
@@ -53,6 +64,12 @@ class WorkerRecorder {
   log(...args) {
     if (this.options.debug) {
       console.log("[WorkerRecorder]", ...args);
+    }
+  }
+
+  warn(...args) {
+    if (this.options.debug) {
+      console.warn("[WorkerRecorder]", ...args);
     }
   }
 
@@ -82,6 +99,16 @@ class WorkerRecorder {
       throw new Error("Could not create offscreen 2D context");
     }
 
+    let audioConfig = null;
+    if (this.audioReadable) {
+      audioConfig = await this.prepareAudioEncoderConfig();
+      if (!audioConfig) {
+        this.warn("[WorkerRecorder] audio encoder not supported; audio track will be omitted");
+        this.audioReadable = null;
+      }
+    }
+    this.enableAudio = Boolean(this.audioReadable && audioConfig);
+
     this.muxer = new Mp4MuxerWrapper({
       width: target.width,
       height: target.height,
@@ -89,15 +116,16 @@ class WorkerRecorder {
       videoBitrate: this.options.videoBitrate,
       audioBitrate: this.options.audioBitrate,
       videoCodec: "avc",
-      audioCodec: this.audioReadable ? "aac" : undefined,
+      audioCodec: this.enableAudio ? this.selectedAudioMuxerCodec : undefined,
       onChunk: (chunk) => {
         this.chunks.push(chunk);
       },
       debug: this.options.debug,
     });
 
-    if (this.audioReadable) {
+    if (this.enableAudio) {
       this.muxer.enableAudio();
+      this.log("[WorkerRecorder] audio track enabled");
     }
 
     await this.muxer.start();
@@ -110,13 +138,9 @@ class WorkerRecorder {
     });
     await this.initVideoEncoder(videoConfig.config);
 
-    if (this.audioReadable) {
-      const audioConfig = await this.prepareAudioEncoderConfig();
-      if (audioConfig) {
-        await this.initAudioEncoder(audioConfig);
-      } else {
-        this.audioReadable = null;
-      }
+    if (this.enableAudio) {
+      await this.initAudioEncoder(audioConfig);
+      this.log("[WorkerRecorder] audio encoder configured", audioConfig);
     }
 
     this.screenPumpPromise = this.pumpVideoFrames(this.screenReader, "screen");
@@ -127,9 +151,10 @@ class WorkerRecorder {
       this.cameraPumpPromise = this.pumpVideoFrames(this.cameraReader, "camera");
     }
 
-    if (this.audioReadable && this.audioEncoder) {
+    if (this.enableAudio && this.audioEncoder) {
       this.audioReader = this.audioReadable.getReader();
       this.audioPumpPromise = this.readAudioLoop();
+      this.log("[WorkerRecorder] audio loop started");
     }
 
     this.renderLoopPromise = this.renderLoop();
@@ -140,6 +165,7 @@ class WorkerRecorder {
         width: target.width,
         height: target.height,
         fps: this.options.fps,
+        audioEnabled: Boolean(this.enableAudio && this.audioReader && this.audioEncoder),
       },
     });
   }
@@ -149,15 +175,33 @@ class WorkerRecorder {
 
     this.running = false;
 
-    await Promise.allSettled([
-      this.screenPumpPromise,
-      this.cameraPumpPromise,
-      this.audioPumpPromise,
-      this.renderLoopPromise,
-    ]);
+    try {
+      const loopPromises = [
+        this.screenPumpPromise,
+        this.cameraPumpPromise,
+        this.audioPumpPromise,
+        this.renderLoopPromise,
+      ].filter(Boolean);
 
-    if (this.videoEncoder && this.videoEncoder.state !== "closed") {
-      await this.videoEncoder.flush();
+      if (loopPromises.length) {
+        await Promise.race([
+          Promise.allSettled(loopPromises),
+          this.delay(500),
+        ]);
+      }
+    } catch (error) {
+      this.warn("[WorkerRecorder] error while waiting for loops", error);
+    }
+
+    try {
+      if (this.videoEncoder && this.videoEncoder.state !== "closed") {
+        await this.videoEncoder.flush();
+      }
+      if (this.audioEncoder && this.audioEncoder.state !== "closed") {
+        await this.audioEncoder.flush();
+      }
+    } catch (error) {
+      this.warn("[WorkerRecorder] encoder flush failed", error);
     }
 
     if (
@@ -197,10 +241,14 @@ class WorkerRecorder {
 
       await this.videoEncoder.flush();
     }
-
-    if (this.audioEncoder && this.audioEncoder.state !== "closed") {
-      await this.audioEncoder.flush();
-    }
+    this.log("[WorkerRecorder] stop summary", {
+      audioReadable: Boolean(this.audioReadable),
+      audioReader: Boolean(this.audioReader),
+      audioEncoder: Boolean(this.audioEncoder),
+      audioChunksEncoded: this.audioChunksEncoded,
+      audioSamplesWritten: this.audioSamplesWritten,
+      audioSampleRate: this.audioSampleRate,
+    });
 
     try {
       await Promise.race([
@@ -318,28 +366,60 @@ class WorkerRecorder {
   async prepareAudioEncoderConfig() {
     if (!this.audioReadable) return null;
 
-    const sampleRate = this.audioConfig?.sampleRate || 48_000;
-    const numberOfChannels = this.audioConfig?.channelCount || 2;
+    const detectedSampleRate = this.audioConfig?.sampleRate || 48_000;
+    const detectedChannels = this.audioConfig?.channelCount || 2;
+    const bitrate = this.options.audioBitrate;
 
-    const candidateConfig = {
-      codec: "mp4a.40.2",
-      sampleRate,
-      numberOfChannels,
-      bitrate: this.options.audioBitrate,
-    };
-
-    const support = await AudioEncoder.isConfigSupported(candidateConfig);
-    if (!support?.supported) {
-      return null;
+    // Ask mediabunny which codecs this browser can actually encode,
+    // probed with the real sample rate and channel count.
+    let encodableCodecs;
+    try {
+      encodableCodecs = await getEncodableAudioCodecs(undefined, {
+        sampleRate: detectedSampleRate,
+        numberOfChannels: detectedChannels,
+        bitrate,
+      });
+    } catch (error) {
+      this.warn("[WorkerRecorder] getEncodableAudioCodecs failed", error);
+      encodableCodecs = [];
     }
 
-    this.audioSampleRate = support.config?.sampleRate || candidateConfig.sampleRate;
-    return support.config || candidateConfig;
+    // Only keep codecs the muxer knows how to write.
+    const supported = encodableCodecs.filter((c) => c in MUXER_CODEC_TO_WEBCODECS);
+    this.log("[WorkerRecorder] encodable audio codecs", supported);
+
+    const sampleRates = [...new Set([detectedSampleRate, 48_000, 44_100])];
+    const channelCounts = detectedChannels > 1 ? [detectedChannels, 1] : [detectedChannels];
+
+    for (const muxerCodec of supported) {
+      for (const webCodec of MUXER_CODEC_TO_WEBCODECS[muxerCodec]) {
+        for (const sampleRate of sampleRates) {
+          for (const numberOfChannels of channelCounts) {
+            const candidate = { codec: webCodec, sampleRate, numberOfChannels, bitrate };
+            try {
+              const support = await AudioEncoder.isConfigSupported(candidate);
+              if (support?.supported) {
+                this.selectedAudioMuxerCodec = muxerCodec;
+                this.audioSampleRate = support.config?.sampleRate || sampleRate;
+                this.log("[WorkerRecorder] using audio config", support.config || candidate);
+                return support.config || candidate;
+              }
+            } catch (error) {
+              this.warn("[WorkerRecorder] probe failed", candidate, error);
+            }
+          }
+        }
+      }
+    }
+
+    this.warn("[WorkerRecorder] no supported audio encoder found on this device");
+    return null;
   }
 
   async initAudioEncoder(config) {
     this.audioEncoder = new AudioEncoder({
       output: (chunk, meta) => {
+        this.audioChunksEncoded += 1;
         this.muxer.addAudioChunk(chunk, meta);
       },
       error: (error) => {
@@ -478,6 +558,9 @@ class WorkerRecorder {
   }
 
   async readAudioLoop() {
+    let framesSeen = 0;
+
+    if (!this.audioReader || !this.audioEncoder) return;
     while (this.running) {
       const { done, value } = await this.audioReader.read().catch(() => ({ done: true }));
 
@@ -489,13 +572,39 @@ class WorkerRecorder {
       const tsUs = Math.round(
         (this.audioSamplesWritten * 1_000_000) / sampleRate
       );
+      const durUs = Math.round((frames * 1_000_000) / sampleRate);
 
-      this.audioEncoder.encode(value, {
-        timestamp: tsUs,
-      });
-      this.audioSamplesWritten += frames;
+      try {
+        this.audioEncoder.encode(value, {
+          timestamp: tsUs,
+        });
+        this.audioSamplesWritten += frames;
+        framesSeen += frames;
+        if (
+          this.options.debug &&
+          (this.audioSamplesWritten === frames ||
+            this.audioSamplesWritten % (sampleRate * 10) < frames)
+        ) {
+          this.log("[WorkerRecorder] audio pts", {
+            samples: this.audioSamplesWritten,
+            tsUs,
+            durUs,
+            sampleRate,
+            totalFramesSeen: framesSeen,
+          });
+        }
+      } catch (error) {
+        value.close?.();
+        this.warn("[WorkerRecorder] audio encode failed", error);
+        break;
+      }
       value.close?.();
     }
+
+    this.log("[WorkerRecorder] audio loop ended", {
+      audioSamplesWritten: this.audioSamplesWritten,
+      audioChunksEncoded: this.audioChunksEncoded,
+    });
   }
 
   cleanup() {
@@ -523,6 +632,14 @@ class WorkerRecorder {
       }
     }
 
+    this.screenReader = null;
+    this.cameraReader = null;
+    this.audioReader = null;
+    this.videoEncoder = null;
+    this.audioEncoder = null;
+    this.muxer = null;
+    this.enableAudio = false;
+    this.selectedAudioMuxerCodec = null;
   }
 
   delay(ms) {

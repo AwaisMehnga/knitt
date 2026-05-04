@@ -1,6 +1,6 @@
 import { create } from "zustand";
-import { getBitrates, getResolutionForQuality } from "../offline-recorder/recorder/recorderConfig";
-import { getUserMediaWithFallback } from "../offline-recorder/shared/pages-utils/mediaDeviceFallback";
+import { getBitrates, getResolutionForQuality } from "../utils/recorderConfig";
+import { getUserMediaWithFallback } from "../utils/mediaDeviceFallback";
 
 const DEFAULT_QUALITY = "1080p";
 const DEFAULT_FPS = 30;
@@ -14,6 +14,37 @@ const stopStream = (stream) => {
   stream?.getTracks?.().forEach((track) => track.stop());
 };
 
+const closeAudioContext = async (audioContext) => {
+  if (!audioContext || audioContext.state === "closed") return;
+
+  try {
+    await audioContext.close();
+  } catch (error) {
+    if (error?.name !== "InvalidStateError") {
+      throw error;
+    }
+  }
+};
+
+const disconnectNode = (node) => {
+  try {
+    node?.disconnect?.();
+  } catch (error) {
+    void error;
+  }
+};
+
+const cleanupAudioGraph = async (audioGraph) => {
+  if (!audioGraph) return;
+
+  disconnectNode(audioGraph.audioInputSource);
+  disconnectNode(audioGraph.audioOutputSource);
+  disconnectNode(audioGraph.audioInputGain);
+  disconnectNode(audioGraph.audioOutputGain);
+  audioGraph.mixedTrack?.stop?.();
+  await closeAudioContext(audioGraph.audioContext);
+};
+
 const createTrackReadable = (track) => {
   if (!track) return null;
   const processor = new MediaStreamTrackProcessor({ track });
@@ -23,24 +54,59 @@ const createTrackReadable = (track) => {
   };
 };
 
-const mixAudioStreams = (streams) => {
-  const tracks = streams.flatMap((stream) => stream?.getAudioTracks?.() || []);
-  if (!tracks.length) {
-    return { audioContext: null, destination: null, mixedTrack: null };
+const createMixedAudioGraph = async ({ systemStream, micStream }) => {
+  const systemTrack = systemStream?.getAudioTracks?.()[0] || null;
+  const micTrack = micStream?.getAudioTracks?.()[0] || null;
+
+  if (!systemTrack && !micTrack) {
+    return {
+      audioContext: null,
+      destination: null,
+      audioInputSource: null,
+      audioOutputSource: null,
+      audioInputGain: null,
+      audioOutputGain: null,
+      mixedTrack: null,
+    };
   }
 
-  const audioContext = new AudioContext();
+  const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+  const audioContext = new AudioContextCtor();
   const destination = audioContext.createMediaStreamDestination();
+  let audioInputSource = null;
+  let audioOutputSource = null;
+  let audioInputGain = null;
+  let audioOutputGain = null;
 
-  streams.forEach((stream) => {
-    if (!stream?.getAudioTracks?.().length) return;
-    const source = audioContext.createMediaStreamSource(stream);
-    source.connect(destination);
-  });
+  if (systemTrack) {
+    audioOutputSource = audioContext.createMediaStreamSource(
+      new MediaStream([systemTrack])
+    );
+    audioOutputGain = audioContext.createGain();
+    audioOutputGain.gain.value = 1;
+    audioOutputSource.connect(audioOutputGain).connect(destination);
+  }
+
+  if (micTrack) {
+    audioInputSource = audioContext.createMediaStreamSource(
+      new MediaStream([micTrack])
+    );
+    audioInputGain = audioContext.createGain();
+    audioInputGain.gain.value = 1;
+    audioInputSource.connect(audioInputGain).connect(destination);
+  }
+
+  if (audioContext.state === "suspended") {
+    await audioContext.resume();
+  }
 
   return {
     audioContext,
     destination,
+    audioInputSource,
+    audioOutputSource,
+    audioInputGain,
+    audioOutputGain,
     mixedTrack: destination.stream.getAudioTracks()[0] || null,
   };
 };
@@ -56,6 +122,7 @@ export const useRecorderStore = create((set, get) => ({
   displayStream: null,
   cameraStream: null,
   audioContext: null,
+  audioGraph: null,
   mixedAudioTrack: null,
 
   startRecording: async () => {
@@ -77,7 +144,7 @@ export const useRecorderStore = create((set, get) => ({
     let displayStream = null;
     let cameraStream = null;
     let worker = null;
-    let audioContext = null;
+    let audioGraph = null;
 
     try {
       const quality = getResolutionForQuality(DEFAULT_QUALITY);
@@ -107,8 +174,10 @@ export const useRecorderStore = create((set, get) => ({
         },
       });
 
-      const audio = mixAudioStreams([displayStream, cameraStream]);
-      audioContext = audio.audioContext;
+      audioGraph = await createMixedAudioGraph({
+        systemStream: displayStream,
+        micStream: cameraStream,
+      });
 
       worker = createRecorderWorker();
 
@@ -123,7 +192,7 @@ export const useRecorderStore = create((set, get) => ({
         });
       };
 
-      worker.onmessage = (event) => {
+      worker.onmessage = async (event) => {
         const { type, blob, error } = event.data || {};
 
         if (type === "started") {
@@ -136,9 +205,9 @@ export const useRecorderStore = create((set, get) => ({
         }
 
         if (type === "stopped" && blob) {
+          await cleanupAudioGraph(audioGraph);
           stopStream(displayStream);
           stopStream(cameraStream);
-          audioContext?.close?.();
           worker.terminate();
           const videoUrl = URL.createObjectURL(blob);
           set({
@@ -151,6 +220,8 @@ export const useRecorderStore = create((set, get) => ({
             displayStream: null,
             cameraStream: null,
             audioContext: null,
+            audioGraph: null,
+            mixedAudioTrack: null,
           });
           return;
         }
@@ -169,7 +240,7 @@ export const useRecorderStore = create((set, get) => ({
 
       const displayVideoTrack = displayStream.getVideoTracks()[0] || null;
       const cameraVideoTrack = cameraStream.getVideoTracks()[0] || null;
-      const mixedAudioTrack = audio.mixedTrack || null;
+      const mixedAudioTrack = audioGraph.mixedTrack || null;
       const screenVideoReadable = createTrackReadable(displayVideoTrack);
       const cameraVideoReadable = createTrackReadable(cameraVideoTrack);
       const audioReadable = createTrackReadable(mixedAudioTrack);
@@ -184,7 +255,8 @@ export const useRecorderStore = create((set, get) => ({
         worker,
         displayStream,
         cameraStream,
-        audioContext,
+        audioContext: audioGraph.audioContext,
+        audioGraph,
         mixedAudioTrack,
         status: "starting-worker",
       });
@@ -196,7 +268,10 @@ export const useRecorderStore = create((set, get) => ({
         audioReadable: audioReadable?.readable || null,
         audioConfig: mixedAudioTrack
           ? {
-              sampleRate: mixedAudioTrack.getSettings().sampleRate || 48000,
+              sampleRate:
+                mixedAudioTrack.getSettings().sampleRate ||
+                audioGraph.audioContext?.sampleRate ||
+                48000,
               channelCount: mixedAudioTrack.getSettings().channelCount || 2,
             }
           : null,
@@ -206,6 +281,7 @@ export const useRecorderStore = create((set, get) => ({
           height: quality.height,
           videoBitrate: bitrates.video,
           audioBitrate: bitrates.audio,
+          debug: import.meta.env.DEV,
         },
       };
 
@@ -223,7 +299,7 @@ export const useRecorderStore = create((set, get) => ({
       worker?.terminate();
       stopStream(displayStream);
       stopStream(cameraStream);
-      await audioContext?.close?.();
+      await cleanupAudioGraph(audioGraph);
 
       set({
         isRecording: false,
@@ -234,6 +310,7 @@ export const useRecorderStore = create((set, get) => ({
         displayStream: null,
         cameraStream: null,
         audioContext: null,
+        audioGraph: null,
         mixedAudioTrack: null,
       });
     }
@@ -244,21 +321,15 @@ export const useRecorderStore = create((set, get) => ({
       worker,
       isRecording,
       isStarting,
-      displayStream,
-      cameraStream,
-      mixedAudioTrack,
-      audioContext,
+      status,
     } = get();
-    if (!worker || (!isRecording && !isStarting)) return;
+    if (!worker || (!isRecording && !isStarting) || status === "stopping") return;
 
     set({
       status: "stopping",
+      isRecording: false,
+      isStarting: false,
     });
-
-    stopStream(displayStream);
-    stopStream(cameraStream);
-    mixedAudioTrack?.stop?.();
-    await audioContext?.close?.();
 
     worker.postMessage({ type: "stop" });
   },
@@ -268,21 +339,20 @@ export const useRecorderStore = create((set, get) => ({
       worker,
       displayStream,
       cameraStream,
-      audioContext,
-      mixedAudioTrack,
+      audioGraph,
     } = get();
 
     worker?.terminate();
+    await cleanupAudioGraph(audioGraph);
     stopStream(displayStream);
     stopStream(cameraStream);
-    mixedAudioTrack?.stop?.();
-    await audioContext?.close?.();
 
     set({
       worker: null,
       displayStream: null,
       cameraStream: null,
       audioContext: null,
+      audioGraph: null,
       mixedAudioTrack: null,
     });
   },

@@ -57,7 +57,8 @@ const createTrackReadable = (track) => {
 const getCaptureProfile = () => {
   const cores = Number(navigator.hardwareConcurrency || 0);
   const memory = Number(navigator.deviceMemory || 0);
-  const highEnd = cores >= 8 && memory >= 8;
+  const memoryKnown = memory > 0;
+  const highEnd = memoryKnown ? cores >= 8 && memory >= 8 : cores >= 6;
 
   if (highEnd) {
     return {
@@ -71,6 +72,17 @@ const getCaptureProfile = () => {
     quality: "1080p",
     fps: 30,
   };
+};
+
+const computeAdaptiveVideoBitrate = ({ width, height, fps }) => {
+  const safeWidth = Number(width) || 1920;
+  const safeHeight = Number(height) || 1080;
+  const safeFps = Number(fps) || 30;
+  const pixelsPerSecond = safeWidth * safeHeight * safeFps;
+  const bitrate = Math.round(pixelsPerSecond * 0.12);
+
+  // Keep quality high while bounding extreme values.
+  return Math.min(45_000_000, Math.max(8_000_000, bitrate));
 };
 
 const createMixedAudioGraph = async ({ systemStream, micStream }) => {
@@ -175,10 +187,21 @@ export const useRecorderStore = create((set, get) => ({
       displayStream = await navigator.mediaDevices.getDisplayMedia({
         video: {
           frameRate: { ideal: profile.fps, max: profile.fps },
-          width: { ideal: quality.width },
-          height: { ideal: quality.height },
+          width: { ideal: Math.max(3840, quality.width), max: 7680 },
+          height: { ideal: Math.max(2160, quality.height), max: 4320 },
         },
         audio: true,
+      });
+
+      const displayVideoTrack = displayStream.getVideoTracks()[0] || null;
+      const displaySettings = displayVideoTrack?.getSettings?.() || {};
+      const targetWidth = displaySettings.width || quality.width;
+      const targetHeight = displaySettings.height || quality.height;
+      const targetFps = Math.round(displaySettings.frameRate || profile.fps);
+      const targetVideoBitrate = computeAdaptiveVideoBitrate({
+        width: targetWidth,
+        height: targetHeight,
+        fps: targetFps,
       });
 
       cameraStream = await getUserMediaWithFallback({
@@ -269,7 +292,6 @@ export const useRecorderStore = create((set, get) => ({
         }
       };
 
-      const displayVideoTrack = displayStream.getVideoTracks()[0] || null;
       const cameraVideoTrack = cameraStream.getVideoTracks()[0] || null;
       const mixedAudioTrack = audioGraph.mixedTrack || null;
       const screenVideoReadable = createTrackReadable(displayVideoTrack);
@@ -308,10 +330,10 @@ export const useRecorderStore = create((set, get) => ({
             }
           : null,
         options: {
-          fps: profile.fps,
-          width: quality.width,
-          height: quality.height,
-          videoBitrate: bitrates.video,
+          fps: targetFps,
+          width: targetWidth,
+          height: targetHeight,
+          videoBitrate: Math.max(bitrates.video, targetVideoBitrate),
           audioBitrate: bitrates.audio,
           debug: import.meta.env.DEV,
         },

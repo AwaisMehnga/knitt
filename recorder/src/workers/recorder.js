@@ -82,7 +82,6 @@ class WorkerRecorder {
   async initializeOPFS() {
     try {
       if (!navigator.storage?.getDirectory) {
-        this.warn("[WorkerRecorder] OPFS not available, falling back to RAM");
         this.useOPFS = false;
         return;
       }
@@ -91,9 +90,8 @@ class WorkerRecorder {
       const fileName = `recording-${Date.now()}.mp4.tmp`;
       this.opfsFileHandle = await root.getFileHandle(fileName, { create: true });
       this.opfsWritableStream = await this.opfsFileHandle.createWritable();
-      this.log("[WorkerRecorder] OPFS initialized with file:", fileName);
     } catch (error) {
-      this.warn("[WorkerRecorder] OPFS initialization failed", error);
+      void error;
       this.useOPFS = false;
     }
   }
@@ -103,7 +101,7 @@ class WorkerRecorder {
     try {
       await this.opfsWritableStream.write(chunk);
     } catch (error) {
-      this.warn("[WorkerRecorder] failed to write chunk to OPFS", error);
+      void error;
       this.useOPFS = false;
       this.opfsWriteFailed = true;
       this.chunks.push(chunk);
@@ -128,7 +126,7 @@ class WorkerRecorder {
     try {
       await this.opfsWriteChain;
     } catch (error) {
-      this.warn("[WorkerRecorder] waiting for OPFS writes failed", error);
+      void error;
       this.opfsWriteFailed = true;
     }
   }
@@ -137,9 +135,8 @@ class WorkerRecorder {
     if (!this.useOPFS || !this.opfsWritableStream) return;
     try {
       await this.opfsWritableStream.flush?.();
-      this.log("[WorkerRecorder] OPFS stream flushed");
     } catch (error) {
-      this.warn("[WorkerRecorder] failed to flush OPFS stream", error);
+      void error;
     }
   }
 
@@ -152,19 +149,17 @@ class WorkerRecorder {
           await this.opfsWritableStream.flush?.();
           await this.opfsWritableStream.close();
           this.opfsWritableStream = null;
-          this.log("[WorkerRecorder] OPFS writable stream closed for reading");
         } catch (error) {
-          this.warn("[WorkerRecorder] error closing writable stream", error);
+          void error;
         }
       }
 
       // Now read the file
       const file = await this.opfsFileHandle.getFile();
       const arrayBuffer = await file.arrayBuffer();
-      this.log("[WorkerRecorder] read from OPFS", { size: arrayBuffer.byteLength });
       return arrayBuffer;
     } catch (error) {
-      this.warn("[WorkerRecorder] failed to read from OPFS", error);
+      void error;
       return null;
     }
   }
@@ -175,7 +170,7 @@ class WorkerRecorder {
         try {
           await this.opfsWritableStream.close();
         } catch (error) {
-          this.log("[WorkerRecorder] writable stream already closed or error closing");
+          void error;
         }
         this.opfsWritableStream = null;
       }
@@ -184,14 +179,13 @@ class WorkerRecorder {
         try {
           const root = await navigator.storage.getDirectory();
           await root.removeEntry(this.opfsFileHandle.name);
-          this.log("[WorkerRecorder] OPFS temp file deleted:", this.opfsFileHandle.name);
         } catch (error) {
-          this.warn("[WorkerRecorder] could not delete OPFS temp file", error);
+          void error;
         }
         this.opfsFileHandle = null;
       }
     } catch (error) {
-      this.warn("[WorkerRecorder] OPFS cleanup error", error);
+      void error;
     }
   }
 
@@ -228,7 +222,6 @@ class WorkerRecorder {
     if (this.audioReadable) {
       audioConfig = await this.prepareAudioEncoderConfig();
       if (!audioConfig) {
-        this.warn("[WorkerRecorder] audio encoder not supported; audio track will be omitted");
         this.audioReadable = null;
       }
     }
@@ -250,7 +243,6 @@ class WorkerRecorder {
 
     if (this.enableAudio) {
       this.muxer.enableAudio();
-      this.log("[WorkerRecorder] audio track enabled");
     }
 
     await this.muxer.start();
@@ -265,7 +257,6 @@ class WorkerRecorder {
 
     if (this.enableAudio) {
       await this.initAudioEncoder(audioConfig);
-      this.log("[WorkerRecorder] audio encoder configured", audioConfig);
     }
 
     this.screenPumpPromise = this.pumpVideoFrames(this.screenReader, "screen");
@@ -279,7 +270,6 @@ class WorkerRecorder {
     if (this.enableAudio && this.audioEncoder) {
       this.audioReader = this.audioReadable.getReader();
       this.audioPumpPromise = this.readAudioLoop();
-      this.log("[WorkerRecorder] audio loop started");
     }
 
     this.renderLoopPromise = this.renderLoop();
@@ -315,7 +305,7 @@ class WorkerRecorder {
         ]);
       }
     } catch (error) {
-      this.warn("[WorkerRecorder] error while waiting for loops", error);
+      void error;
     }
 
     try {
@@ -326,7 +316,7 @@ class WorkerRecorder {
         await this.audioEncoder.flush();
       }
     } catch (error) {
-      this.warn("[WorkerRecorder] encoder flush failed", error);
+      void error;
     }
 
     if (
@@ -366,16 +356,6 @@ class WorkerRecorder {
 
       await this.videoEncoder.flush();
     }
-    this.log("[WorkerRecorder] stop summary", {
-      audioReadable: Boolean(this.audioReadable),
-      audioReader: Boolean(this.audioReader),
-      audioEncoder: Boolean(this.audioEncoder),
-      audioChunksEncoded: this.audioChunksEncoded,
-      audioSamplesWritten: this.audioSamplesWritten,
-      audioSampleRate: this.audioSampleRate,
-      useOPFS: this.useOPFS,
-    });
-
     try {
       await Promise.race([
         this.muxer.finalize(),
@@ -397,22 +377,12 @@ class WorkerRecorder {
       const opfsData = await this.readChunksFromOPFS();
       if (opfsData && opfsData.byteLength > 0) {
         blob = new Blob([opfsData], { type: "video/mp4" });
-        this.log("[WorkerRecorder] created blob from OPFS", {
-          size: blob.size,
-          opfsDataSize: opfsData.byteLength,
-        });
       } else {
         // Fallback to RAM chunks if OPFS read failed or empty
-        this.warn("[WorkerRecorder] OPFS data empty or failed, falling back to RAM");
         blob = new Blob(this.chunks, { type: "video/mp4" });
-        this.log("[WorkerRecorder] created blob from RAM chunks", {
-          size: blob.size,
-          chunksCount: this.chunks.length,
-        });
       }
     } else {
       blob = new Blob(this.chunks, { type: "video/mp4" });
-      this.log("[WorkerRecorder] created blob from RAM");
     }
 
     // Now cleanup resources (including deleting OPFS file)
@@ -530,13 +500,12 @@ class WorkerRecorder {
         bitrate,
       });
     } catch (error) {
-      this.warn("[WorkerRecorder] getEncodableAudioCodecs failed", error);
+      void error;
       encodableCodecs = [];
     }
 
     // Only keep codecs the muxer knows how to write.
     const supported = encodableCodecs.filter((c) => c in MUXER_CODEC_TO_WEBCODECS);
-    this.log("[WorkerRecorder] encodable audio codecs", supported);
 
     const sampleRates = [...new Set([detectedSampleRate, 48_000, 44_100])];
     const channelCounts = detectedChannels > 1 ? [detectedChannels, 1] : [detectedChannels];
@@ -551,18 +520,16 @@ class WorkerRecorder {
               if (support?.supported) {
                 this.selectedAudioMuxerCodec = muxerCodec;
                 this.audioSampleRate = support.config?.sampleRate || sampleRate;
-                this.log("[WorkerRecorder] using audio config", support.config || candidate);
                 return support.config || candidate;
               }
             } catch (error) {
-              this.warn("[WorkerRecorder] probe failed", candidate, error);
+              void error;
             }
           }
         }
       }
     }
 
-    this.warn("[WorkerRecorder] no supported audio encoder found on this device");
     return null;
   }
 
@@ -730,31 +697,13 @@ class WorkerRecorder {
         });
         this.audioSamplesWritten += frames;
         framesSeen += frames;
-        if (
-          this.options.debug &&
-          (this.audioSamplesWritten === frames ||
-            this.audioSamplesWritten % (sampleRate * 10) < frames)
-        ) {
-          this.log("[WorkerRecorder] audio pts", {
-            samples: this.audioSamplesWritten,
-            tsUs,
-            durUs,
-            sampleRate,
-            totalFramesSeen: framesSeen,
-          });
-        }
       } catch (error) {
         value.close?.();
-        this.warn("[WorkerRecorder] audio encode failed", error);
+        void error;
         break;
       }
       value.close?.();
     }
-
-    this.log("[WorkerRecorder] audio loop ended", {
-      audioSamplesWritten: this.audioSamplesWritten,
-      audioChunksEncoded: this.audioChunksEncoded,
-    });
   }
 
   cleanup() {
@@ -793,7 +742,7 @@ class WorkerRecorder {
 
     // Cleanup OPFS resources (async, so we don't await here)
     this.cleanupOPFS().catch((error) => {
-      this.warn("[WorkerRecorder] error during OPFS cleanup", error);
+      void error;
     });
     this.opfsWriteChain = Promise.resolve();
     this.opfsWriteFailed = false;

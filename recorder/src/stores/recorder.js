@@ -157,6 +157,13 @@ export const useRecorderStore = create((set, get) => ({
   capabilities: null,
   recordCamera: false,
   recordMic: true,
+  // PiP customization
+  pipPosition: "bottom-left",
+  pipSize: 12,
+  pipOpacity: 100,
+  pipBorderRadius: 8,
+  pipShape: "circle",
+  pipHidden: false,
   displayStream: null,
   cameraStream: null,
   micStream: null,
@@ -208,6 +215,7 @@ export const useRecorderStore = create((set, get) => ({
           frameRate: { ideal: profile.fps, max: profile.fps },
           width: { ideal: Math.max(3840, quality.width), max: 7680 },
           height: { ideal: Math.max(2160, quality.height), max: 4320 },
+          displaySurface: "monitor",
         },
         audio: true,
       });
@@ -499,6 +507,12 @@ export const useRecorderStore = create((set, get) => ({
           videoBitrate: Math.max(bitrates.video, targetVideoBitrate),
           audioBitrate: bitrates.audio,
           debug: import.meta.env.DEV,
+          pipPosition: get().pipPosition,
+          pipSize: get().pipSize,
+          pipOpacity: get().pipOpacity,
+          pipBorderRadius: get().pipBorderRadius,
+          pipShape: get().pipShape,
+          pipHidden: get().pipHidden,
         },
       };
 
@@ -691,5 +705,60 @@ export const useRecorderStore = create((set, get) => ({
 
   setRecordMic: (value) => {
     set({ recordMic: Boolean(value) });
+  },
+
+  setPipPosition: (position) => {
+    set({ pipPosition: position });
+  },
+
+  setPipSize: (size) => {
+    set({ pipSize: Math.max(10, Math.min(50, Number(size))) });
+  },
+
+  setPipOpacity: (opacity) => {
+    set({ pipOpacity: Math.max(0, Math.min(100, Number(opacity))) });
+  },
+
+  setPipBorderRadius: (radius) => {
+    set({ pipBorderRadius: Math.max(0, Math.min(100, Number(radius))) });
+  },
+
+  setPipShape: (shape) => {
+    set({ pipShape: shape });
+  },
+
+  togglePipVisibility: () => {
+    set({ pipHidden: !get().pipHidden });
+  },
+
+  updatePipPositionDuringRecording: (position) => {
+    const { worker, useMediaRecorderFallback } = get();
+    set({ pipPosition: position });
+    
+    // Send update to worker in real-time if recording with WebCodecs
+    if (worker && !useMediaRecorderFallback) {
+      worker.postMessage({
+        type: "updateOptions",
+        options: {
+          pipPosition: position,
+        },
+      });
+    }
+  },
+
+  updatePipVisibilityDuringRecording: () => {
+    const { worker, useMediaRecorderFallback, pipHidden } = get();
+    const newHidden = !pipHidden;
+    set({ pipHidden: newHidden });
+    
+    // Send update to worker in real-time if recording with WebCodecs
+    if (worker && !useMediaRecorderFallback) {
+      worker.postMessage({
+        type: "updateOptions",
+        options: {
+          pipHidden: newHidden,
+        },
+      });
+    }
   },
 }));

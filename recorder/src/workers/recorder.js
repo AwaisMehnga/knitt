@@ -25,6 +25,12 @@ class WorkerRecorder {
       videoBitrate: options?.videoBitrate || 8_000_000,
       audioBitrate: options?.audioBitrate || 128_000,
       debug: Boolean(options?.debug),
+      pipPosition: options?.pipPosition || "bottom-right",
+      pipSize: options?.pipSize || 10,
+      pipOpacity: options?.pipOpacity || 100,
+      pipBorderRadius: options?.pipBorderRadius || 8,
+      pipShape: options?.pipShape || "rectangle",
+      pipHidden: options?.pipHidden || false,
     };
     this.opfsWriteChain = Promise.resolve();
     this.opfsWriteFailed = false;
@@ -777,31 +783,113 @@ class WorkerRecorder {
     this.ctx.clearRect(0, 0, width, height);
     this.ctx.drawImage(screenFrame, 0, 0, width, height);
 
-    if (!cameraFrame) {
+    // Skip drawing camera if PiP is hidden or no camera frame
+    if (!cameraFrame || this.options.pipHidden) {
       return;
     }
 
-    const insetWidth = Math.round(width * 0.22);
-    const insetHeight = Math.round(
-      insetWidth * (cameraFrame.displayHeight || cameraFrame.codedHeight) /
-      (cameraFrame.displayWidth || cameraFrame.codedWidth)
-    );
+    const shape = this.options.pipShape || "rectangle";
     const padding = Math.round(width * 0.02);
-    const x = width - insetWidth - padding;
-    const y = height - insetHeight - padding;
-    const radius = Math.round(insetWidth * 0.08);
+    const opacity = (this.options.pipOpacity || 100) / 100;
+    
+    const cameraWidth = cameraFrame.displayWidth || cameraFrame.codedWidth;
+    const cameraHeight = cameraFrame.displayHeight || cameraFrame.codedHeight;
+    
+    let insetWidth = Math.round(width * (this.options.pipSize / 100));
+    let insetHeight = insetWidth;
+    let sourceCropX = 0, sourceCropY = 0, sourceCropWidth = cameraWidth, sourceCropHeight = cameraHeight;
+
+    // Adjust dimensions and calculate crop based on shape
+    if (shape === "square") {
+      // Square: crop camera to square (center portion)
+      const size = Math.min(insetWidth, insetHeight);
+      insetWidth = size;
+      insetHeight = size;
+      
+      // Crop camera frame to square
+      const minDim = Math.min(cameraWidth, cameraHeight);
+      sourceCropWidth = minDim;
+      sourceCropHeight = minDim;
+      sourceCropX = (cameraWidth - minDim) / 2;
+      sourceCropY = (cameraHeight - minDim) / 2;
+    } else if (shape === "circle") {
+      // Circle: crop camera to square (center portion) - same as square for cropping
+      const size = Math.min(insetWidth, insetHeight);
+      insetWidth = size;
+      insetHeight = size;
+      
+      // Crop camera frame to square
+      const minDim = Math.min(cameraWidth, cameraHeight);
+      sourceCropWidth = minDim;
+      sourceCropHeight = minDim;
+      sourceCropX = (cameraWidth - minDim) / 2;
+      sourceCropY = (cameraHeight - minDim) / 2;
+    } else {
+      // Rectangle: maintain aspect ratio of camera feed
+      insetHeight = Math.round(
+        insetWidth * cameraHeight / cameraWidth
+      );
+    }
+    
+    // Calculate position based on pipPosition option
+    let x, y;
+    const pos = this.options.pipPosition || "bottom-right";
+    const cornerCases = {
+      "top-left": { x: padding, y: padding },
+      "top-center": { x: (width - insetWidth) / 2, y: padding },
+      "top-right": { x: width - insetWidth - padding, y: padding },
+      "center-left": { x: padding, y: (height - insetHeight) / 2 },
+      "center": { x: (width - insetWidth) / 2, y: (height - insetHeight) / 2 },
+      "center-right": { x: width - insetWidth - padding, y: (height - insetHeight) / 2 },
+      "bottom-left": { x: padding, y: height - insetHeight - padding },
+      "bottom-center": { x: (width - insetWidth) / 2, y: height - insetHeight - padding },
+      "bottom-right": { x: width - insetWidth - padding, y: height - insetHeight - padding },
+    };
+    
+    const posData = cornerCases[pos] || cornerCases["bottom-right"];
+    x = Math.round(posData.x);
+    y = Math.round(posData.y);
+    
+    const radiusPercent = this.options.pipBorderRadius || 8;
+    const radius = Math.round((insetWidth * radiusPercent) / 100);
 
     this.ctx.save();
-    this.roundRect(x, y, insetWidth, insetHeight, radius);
-    this.ctx.clip();
-    this.ctx.drawImage(cameraFrame, x, y, insetWidth, insetHeight);
+    
+    // Draw shape-specific clipping
+    if (shape === "circle") {
+      // Circular clip
+      this.ctx.beginPath();
+      this.ctx.arc(x + insetWidth / 2, y + insetHeight / 2, insetWidth / 2, 0, Math.PI * 2);
+      this.ctx.clip();
+    } else {
+      // Rectangle or square with optional rounding
+      this.roundRect(x, y, insetWidth, insetHeight, radius);
+      this.ctx.clip();
+    }
+    
+    this.ctx.globalAlpha = opacity;
+    // Draw cropped camera frame
+    this.ctx.drawImage(
+      cameraFrame,
+      sourceCropX, sourceCropY, sourceCropWidth, sourceCropHeight,
+      x, y, insetWidth, insetHeight
+    );
     this.ctx.restore();
 
     this.ctx.save();
-    this.ctx.strokeStyle = "rgba(255,255,255,0.85)";
+    this.ctx.strokeStyle = `rgba(255,255,255,${0.85 * opacity})`;
     this.ctx.lineWidth = Math.max(2, Math.round(width * 0.002));
-    this.roundRect(x, y, insetWidth, insetHeight, radius);
-    this.ctx.stroke();
+    
+    if (shape === "circle") {
+      // Draw circular border
+      this.ctx.beginPath();
+      this.ctx.arc(x + insetWidth / 2, y + insetHeight / 2, insetWidth / 2, 0, Math.PI * 2);
+      this.ctx.stroke();
+    } else {
+      // Draw rounded rectangle border
+      this.roundRect(x, y, insetWidth, insetHeight, radius);
+      this.ctx.stroke();
+    }
     this.ctx.restore();
   }
 
@@ -884,6 +972,7 @@ class WorkerRecorder {
     this.muxer = null;
     this.enableAudio = false;
     this.selectedAudioMuxerCodec = null;
+    state.controller = null;
 
     // Cleanup OPFS resources (async, so we don't await here)
     this.cleanupOPFS().catch((error) => {
@@ -906,9 +995,16 @@ class WorkerRecorder {
 }
 
 self.onmessage = async (event) => {
-  const { type, payload } = event.data || {};
+  const { type, payload, options } = event.data || {};
 
   try {
+    if (type === "updateOptions") {
+      if (state.controller) {
+        Object.assign(state.controller.options, payload?.options || options || {});
+      }
+      return;
+    }
+
     if (type === "start") {
       state.controller = new WorkerRecorder(payload);
       await state.controller.start();

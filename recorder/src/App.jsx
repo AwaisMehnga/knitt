@@ -161,6 +161,22 @@ function App() {
                   className="w-full"
                 />
               </div>
+
+              {/* Border radius */}
+              <div className="flex flex-col gap-2">
+                <label htmlFor="pipBorderRadius" className="text-sm font-medium">
+                  Border Radius: {pipBorderRadius}%
+                </label>
+                <input
+                  type="range"
+                  id="pipBorderRadius"
+                  min="0"
+                  max="100"
+                  value={pipBorderRadius}
+                  onChange={(e) => setPipBorderRadius(e.target.value)}
+                  className="w-full"
+                />
+              </div>
             </div>
           )}
 

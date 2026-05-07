@@ -1,0 +1,33 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "waitlist-api",
+  "main": "src/index.js",
+  "compatibility_date": "2026-05-06",
+
+  "observability": {
+    "enabled": true
+  },
+
+  "upload_source_maps": true,
+
+  "compatibility_flags": ["nodejs_compat"],
+
+  "d1_databases": [
+    {
+      "binding": "knitt_waitlist",
+      "database_name": "knitt-waitlist",
+      "database_id": "08332f0d-d126-4821-a288-a8d0edb227fa"
+    }
+  ],
+
+  "vars": {
+    "ALLOWED_ORIGIN": "https://knitt.video"
+  },
+
+  "send_email": [
+    {
+      "name": "EMAIL",
+      "destination_address": "noreply@knitt.video"
+    }
+  ]
+}

@@ -57,10 +57,12 @@ class Canvas2DCompositeRenderer {
     this.canvas = new OffscreenCanvas(width, height);
     this.ctx = this.canvas.getContext("2d", {
       alpha: false,
+      colorSpace: "srgb",
       desynchronized: true,
     });
 
     if (!this.ctx) throw new Error("Could not create offscreen 2D context");
+    this.ctx.imageSmoothingEnabled = false;
   }
 
   draw(screenFrame, cameraFrame, options) {
@@ -78,9 +80,8 @@ class Canvas2DCompositeRenderer {
     });
     const camera = getFrameSize(cameraFrame);
     const [cropX, cropY, cropWidth, cropHeight] = layout.crop;
-    const radius = Math.round(
-      (layout.width * Math.max(0, Number(options.pipBorderRadius || 0))) / 100
-    );
+    // Border radius control removed — always use no corner rounding for overlay rectangles
+    const radius = 0;
     const opacity = Math.max(0, Math.min(1, (options.pipOpacity || 100) / 100));
 
     this.ctx.save();

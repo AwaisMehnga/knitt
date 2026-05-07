@@ -37,6 +37,8 @@ export class WorkerRecorder {
     this.options = { ...DEFAULT_OPTIONS, ...(options || {}) };
 
     this.running = false;
+    this.stopped = false;
+    this.pausedAtUs = null;
     this.startedAtUs = null;
     this.frameIndex = 0;
     this.frameDurationUs = Math.round(1_000_000 / this.options.fps);
@@ -88,6 +90,7 @@ export class WorkerRecorder {
       height: target.height,
       fps: this.options.fps,
       bitrate: this.options.videoBitrate,
+      bitrateMode: this.options.bitrateMode,
     });
     target = {
       width: videoConfig.width || target.width,
@@ -159,9 +162,30 @@ export class WorkerRecorder {
     Object.assign(this.options, options || {});
   }
 
+  pause() {
+    if (this.running) {
+      this.running = false;
+      // Track pause time for timing adjustment on resume
+      this.pausedAtUs = performance.now() * 1000;
+    }
+  }
+
+  resume() {
+    if (!this.running) {
+      this.running = true;
+      // Adjust start time by the pause duration to keep timing continuous
+      if (this.pausedAtUs && this.startedAtUs !== null) {
+        const pauseDurationUs = (performance.now() * 1000) - this.pausedAtUs;
+        this.startedAtUs += pauseDurationUs;
+      }
+      this.pausedAtUs = null;
+    }
+  }
+
   async stop() {
-    if (!this.running) return;
+    if (this.stopped) return;
     this.running = false;
+    this.stopped = true;
 
     await this.waitForLoops();
     await this.flushEncoders();
@@ -283,7 +307,7 @@ export class WorkerRecorder {
   }
 
   async pumpVideoFrames(reader, kind) {
-    while (this.running) {
+    while (!this.stopped) {
       const { done, value } = await reader.read().catch(() => ({ done: true }));
       if (done || !value) break;
 
@@ -296,7 +320,13 @@ export class WorkerRecorder {
   }
 
   async renderLoop() {
-    while (this.running) {
+    while (!this.stopped) {
+      // Skip rendering while paused, but keep the loop running
+      if (!this.running) {
+        await delay(4);
+        continue;
+      }
+
       const nowUs = performance.now() * 1000;
       if (this.startedAtUs == null) this.startedAtUs = nowUs;
 
@@ -358,11 +388,18 @@ export class WorkerRecorder {
   async readAudioLoop() {
     if (!this.audioReader || !this.audioEncoder) return;
 
-    while (this.running) {
+    while (!this.stopped) {
       const { done, value } = await this.audioReader
         .read()
         .catch(() => ({ done: true }));
       if (done || !value) break;
+
+      // Skip encoding audio while paused, but keep reading
+      if (!this.running) {
+        closeFrame(value);
+        await delay(4);
+        continue;
+      }
 
       const frames =
         typeof value.numberOfFrames === "number" ? value.numberOfFrames : 0;

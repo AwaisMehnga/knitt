@@ -1,24 +1,32 @@
-import { getBitrates, getResolutionForQuality } from "../utils/recorderConfig";
+import { getResolutionForQuality, resolveRecordingSettings } from "../utils/recorderConfig";
 import { getUserMediaWithFallback } from "../utils/mediaDeviceFallback";
-import {
-  computeAdaptiveVideoBitrate,
-  getCaptureProfile,
-} from "./capabilities";
+import { getCaptureProfile } from "./capabilities";
 
 export const stopStream = (stream) => {
   stream?.getTracks?.().forEach((track) => track.stop());
 };
 
-export const captureRecorderStreams = async ({ recordCamera, recordMic }) => {
+export const captureRecorderStreams = async ({
+  recordCamera,
+  recordMic,
+  recordingQuality,
+  recordingFps,
+  bitratePreset,
+  customVideoBitrateMbps,
+  audioBitrateKbps,
+}) => {
   const profile = getCaptureProfile();
-  const quality = getResolutionForQuality(profile.quality);
-  const bitrates = getBitrates(profile.quality);
+  const qualityValue = recordingQuality || profile.quality;
+  const quality = getResolutionForQuality(qualityValue);
+  const requestedFps = Number(recordingFps || profile.fps);
+  const idealWidth = quality.width || 3840;
+  const idealHeight = quality.height || 2160;
 
   const displayStream = await navigator.mediaDevices.getDisplayMedia({
     video: {
-      frameRate: { ideal: profile.fps, max: profile.fps },
-      width: { ideal: Math.max(3840, quality.width), max: 7680 },
-      height: { ideal: Math.max(2160, quality.height), max: 4320 },
+      frameRate: { ideal: requestedFps, max: requestedFps },
+      width: { ideal: idealWidth },
+      height: { ideal: idealHeight },
       displaySurface: "monitor",
     },
     audio: true,
@@ -31,9 +39,9 @@ export const captureRecorderStreams = async ({ recordCamera, recordMic }) => {
     cameraStream = await getUserMediaWithFallback({
       constraints: {
         video: {
-          width: { ideal: 1920 },
-          height: { ideal: 1080 },
-          frameRate: { ideal: profile.fps, max: profile.fps },
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+          frameRate: { ideal: Math.min(requestedFps, 30), max: Math.min(requestedFps, 30) },
         },
         audio: false,
       },
@@ -59,9 +67,16 @@ export const captureRecorderStreams = async ({ recordCamera, recordMic }) => {
 
   const displayVideoTrack = displayStream.getVideoTracks()[0] || null;
   const displaySettings = displayVideoTrack?.getSettings?.() || {};
-  const targetWidth = displaySettings.width || quality.width;
-  const targetHeight = displaySettings.height || quality.height;
-  const targetFps = Math.round(displaySettings.frameRate || profile.fps);
+  const recordingSettings = resolveRecordingSettings({
+    sourceWidth: displaySettings.width || quality.width,
+    sourceHeight: displaySettings.height || quality.height,
+    sourceFps: displaySettings.frameRate || requestedFps,
+    quality: qualityValue,
+    fps: requestedFps,
+    bitratePreset,
+    customVideoBitrateMbps,
+    audioBitrateKbps,
+  });
 
   return {
     displayStream,
@@ -70,18 +85,7 @@ export const captureRecorderStreams = async ({ recordCamera, recordMic }) => {
     displayVideoTrack,
     cameraVideoTrack: cameraStream?.getVideoTracks()[0] || null,
     captureOptions: {
-      fps: targetFps,
-      width: targetWidth,
-      height: targetHeight,
-      videoBitrate: Math.max(
-        bitrates.video,
-        computeAdaptiveVideoBitrate({
-          width: targetWidth,
-          height: targetHeight,
-          fps: targetFps,
-        })
-      ),
-      audioBitrate: bitrates.audio,
+      ...recordingSettings,
     },
   };
 };

@@ -22,16 +22,6 @@ export const getCaptureProfile = () => {
   const highEnd = memoryKnown ? cores >= 8 && memory >= 8 : cores >= 6;
 
   return highEnd
-    ? { quality: "4k", fps: 60 }
+    ? { quality: "1080p", fps: 30 }
     : { quality: "1080p", fps: 30 };
-};
-
-export const computeAdaptiveVideoBitrate = ({ width, height, fps }) => {
-  const safeWidth = Number(width) || 1920;
-  const safeHeight = Number(height) || 1080;
-  const safeFps = Number(fps) || 30;
-  const pixelsPerSecond = safeWidth * safeHeight * safeFps;
-  const bitrate = Math.round(pixelsPerSecond * 0.12);
-
-  return Math.min(45_000_000, Math.max(8_000_000, bitrate));
 };

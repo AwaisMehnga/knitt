@@ -14,6 +14,7 @@ import {
 const initialRecorderState = {
   isRecording: false,
   isStarting: false,
+  isPaused: false,
   status: "idle",
   error: null,
   videoUrl: null,
@@ -28,11 +29,17 @@ const initialRecorderState = {
   audioContext: null,
   audioGraph: null,
   mixedAudioTrack: null,
+  previewStream: null,
 };
 
 const initialPipState = {
   recordCamera: false,
   recordMic: true,
+  recordingQuality: "1080p",
+  recordingFps: 30,
+  bitratePreset: "balanced",
+  customVideoBitrateMbps: 3,
+  audioBitrateKbps: 96,
   pipPosition: "bottom-left",
   pipSize: 12,
   pipOpacity: 100,
@@ -70,6 +77,25 @@ const createVideoUrl = (blob, previousUrl) => {
   return URL.createObjectURL(blob);
 };
 
+const syncPipOptionsToRecorder = (state, options) => {
+  const { worker, fallbackRecorder, useMediaRecorderFallback } = state;
+
+  if (worker && !useMediaRecorderFallback) {
+    worker.postMessage({
+      type: "updateOptions",
+      options,
+    });
+    return;
+  }
+
+  if (fallbackRecorder && useMediaRecorderFallback) {
+    fallbackRecorder.updateOptions(options);
+  }
+};
+
+const isExternalCaptureEnd = (state) =>
+  (state.isRecording || state.isStarting) && state.status !== "stopping";
+
 export const useRecorderStore = create((set, get) => ({
   ...initialRecorderState,
   ...initialPipState,
@@ -104,6 +130,11 @@ export const useRecorderStore = create((set, get) => ({
       capture = await captureRecorderStreams({
         recordCamera: get().recordCamera,
         recordMic: get().recordMic,
+        recordingQuality: get().recordingQuality,
+        recordingFps: get().recordingFps,
+        bitratePreset: get().bitratePreset,
+        customVideoBitrateMbps: get().customVideoBitrateMbps,
+        audioBitrateKbps: get().audioBitrateKbps,
       });
 
       audioGraph = await createMixedAudioGraph({
@@ -113,10 +144,36 @@ export const useRecorderStore = create((set, get) => ({
 
       const useWorkerPipeline = capabilities.webCodecs;
 
-      capture.displayVideoTrack?.addEventListener("ended", () => {
-        if (get().isRecording || get().isStarting) {
-          get().stopRecording();
-        }
+      capture.displayVideoTrack?.addEventListener("ended", async () => {
+        if (!isExternalCaptureEnd(get())) return;
+
+        await cleanupSession({
+          worker,
+          fallbackRecorder,
+          displayStream: capture?.displayStream,
+          cameraStream: capture?.cameraStream,
+          micStream: capture?.micStream,
+          audioGraph,
+        });
+
+        set({
+          isRecording: false,
+          isStarting: false,
+          isPaused: false,
+          status: "capture-ended",
+          error:
+            "Screen capture ended before you clicked Save. On macOS, window capture can end when the selected window is no longer available.",
+          worker: null,
+          fallbackRecorder: null,
+          useMediaRecorderFallback: false,
+          displayStream: null,
+          cameraStream: null,
+          micStream: null,
+          audioContext: null,
+          audioGraph: null,
+          mixedAudioTrack: null,
+          previewStream: null,
+        });
       });
 
       set({
@@ -126,6 +183,7 @@ export const useRecorderStore = create((set, get) => ({
         audioContext: audioGraph.audioContext,
         audioGraph,
         mixedAudioTrack: audioGraph.mixedTrack,
+        previewStream: capture.displayStream,
       });
 
       const startFallbackRecorder = async () => {
@@ -366,9 +424,56 @@ export const useRecorderStore = create((set, get) => ({
     worker?.postMessage({ type: "stop" });
   },
 
+  pauseRecording: async () => {
+    const { isRecording, isPaused, worker, fallbackRecorder, useMediaRecorderFallback } = get();
+    if (!isRecording || isPaused) return;
+
+    set({ isPaused: true, status: "paused" });
+
+    if (useMediaRecorderFallback && fallbackRecorder?.pause) {
+      try {
+        fallbackRecorder.pause();
+      } catch (error) {
+        console.warn("Failed to pause fallback recorder:", error);
+      }
+      return;
+    }
+
+    if (worker) {
+      worker.postMessage({ type: "pause" });
+    }
+  },
+
+  resumeRecording: async () => {
+    const { isRecording, isPaused, worker, fallbackRecorder, useMediaRecorderFallback } = get();
+    if (!isRecording || !isPaused) return;
+
+    set({ isPaused: false, status: "recording" });
+
+    if (useMediaRecorderFallback && fallbackRecorder?.resume) {
+      try {
+        fallbackRecorder.resume();
+      } catch (error) {
+        console.warn("Failed to resume fallback recorder:", error);
+      }
+      return;
+    }
+
+    if (worker) {
+      worker.postMessage({ type: "resume" });
+    }
+  },
+
   cleanup: async () => {
     await cleanupSession(get());
     set({
+      isRecording: false,
+      isStarting: false,
+      isPaused: false,
+      status: "idle",
+      error: null,
+      videoUrl: null,
+      blob: null,
       worker: null,
       fallbackRecorder: null,
       useMediaRecorderFallback: false,
@@ -378,46 +483,57 @@ export const useRecorderStore = create((set, get) => ({
       audioContext: null,
       audioGraph: null,
       mixedAudioTrack: null,
+      previewStream: null,
     });
   },
+
+  setPreviewStream: (stream) => set({ previewStream: stream }),
 
   toggleRecordCamera: () => set({ recordCamera: !get().recordCamera }),
   toggleRecordMic: () => set({ recordMic: !get().recordMic }),
   setRecordCamera: (value) => set({ recordCamera: Boolean(value) }),
   setRecordMic: (value) => set({ recordMic: Boolean(value) }),
-  setPipPosition: (position) => set({ pipPosition: position }),
-  setPipSize: (size) => set({ pipSize: Math.max(10, Math.min(50, Number(size))) }),
-  setPipOpacity: (opacity) =>
-    set({ pipOpacity: Math.max(0, Math.min(100, Number(opacity))) }),
-  setPipBorderRadius: (radius) =>
-    set({ pipBorderRadius: Math.max(0, Math.min(100, Number(radius))) }),
-  setPipShape: (shape) => set({ pipShape: shape }),
-  togglePipVisibility: () => set({ pipHidden: !get().pipHidden }),
+  setRecordingQuality: (recordingQuality) => set({ recordingQuality }),
+  setRecordingFps: (recordingFps) => set({ recordingFps: Number(recordingFps) }),
+  setBitratePreset: (bitratePreset) => set({ bitratePreset }),
+  setCustomVideoBitrateMbps: (customVideoBitrateMbps) =>
+    set({ customVideoBitrateMbps: Math.max(0.5, Number(customVideoBitrateMbps)) }),
+  setAudioBitrateKbps: (audioBitrateKbps) =>
+    set({ audioBitrateKbps: Math.max(48, Number(audioBitrateKbps)) }),
+  setPipPosition: (position) => {
+    set({ pipPosition: position });
+    syncPipOptionsToRecorder(get(), { pipPosition: position });
+  },
+  setPipSize: (size) => {
+    const pipSize = Math.max(10, Math.min(50, Number(size)));
+    set({ pipSize });
+    syncPipOptionsToRecorder(get(), { pipSize });
+  },
+  setPipOpacity: (opacity) => {
+    const pipOpacity = Math.max(0, Math.min(100, Number(opacity)));
+    set({ pipOpacity });
+    syncPipOptionsToRecorder(get(), { pipOpacity });
+  },
+  setPipBorderRadius: (radius) => {
+    const pipBorderRadius = Math.max(0, Math.min(100, Number(radius)));
+    set({ pipBorderRadius });
+    syncPipOptionsToRecorder(get(), { pipBorderRadius });
+  },
+  setPipShape: (shape) => {
+    set({ pipShape: shape });
+    syncPipOptionsToRecorder(get(), { pipShape: shape });
+  },
+  togglePipVisibility: () => {
+    const pipHidden = !get().pipHidden;
+    set({ pipHidden });
+    syncPipOptionsToRecorder(get(), { pipHidden });
+  },
 
   updatePipPositionDuringRecording: (position) => {
-    const { worker, fallbackRecorder, useMediaRecorderFallback } = get();
-    set({ pipPosition: position });
-    if (worker && !useMediaRecorderFallback) {
-      worker.postMessage({
-        type: "updateOptions",
-        options: { pipPosition: position },
-      });
-    } else if (fallbackRecorder && useMediaRecorderFallback) {
-      fallbackRecorder.updateOptions({ pipPosition: position });
-    }
+    get().setPipPosition(position);
   },
 
   updatePipVisibilityDuringRecording: () => {
-    const { worker, fallbackRecorder, useMediaRecorderFallback, pipHidden } = get();
-    const pipHiddenNext = !pipHidden;
-    set({ pipHidden: pipHiddenNext });
-    if (worker && !useMediaRecorderFallback) {
-      worker.postMessage({
-        type: "updateOptions",
-        options: { pipHidden: pipHiddenNext },
-      });
-    } else if (fallbackRecorder && useMediaRecorderFallback) {
-      fallbackRecorder.updateOptions({ pipHidden: pipHiddenNext });
-    }
+    get().togglePipVisibility();
   },
 }));

@@ -28,6 +28,7 @@ const waitForStop = (mediaRecorder) =>
       resolve();
       return;
     }
+
     const previous = mediaRecorder.onstop;
     mediaRecorder.onstop = (event) => {
       previous?.(event);
@@ -47,10 +48,12 @@ const createVideoElement = async (stream) => {
       video.removeEventListener("loadedmetadata", resolveReady);
       video.removeEventListener("error", rejectReady);
     };
+
     const resolveReady = () => {
       cleanup();
       resolve();
     };
+
     const rejectReady = () => {
       cleanup();
       reject(new Error("Could not initialize fallback video compositor"));
@@ -116,6 +119,7 @@ const getPipLayout = ({ canvasWidth, canvasHeight, cameraVideo, pipOptions }) =>
       y: canvasHeight - height - padding,
     },
   };
+
   const position = positions[pipOptions.pipPosition] || positions["bottom-right"];
 
   return {
@@ -152,12 +156,15 @@ const createCanvasComposer = async ({
   const displayVideo = await createVideoElement(displayStream);
   const cameraVideo = await createVideoElement(cameraStream);
   const canvas = document.createElement("canvas");
-  const ctx = canvas.getContext("2d", { alpha: false });
+  const ctx = canvas.getContext("2d", { alpha: false, colorSpace: "srgb" });
   const currentPipOptions = { ...pipOptions };
   let running = false;
   let animationFrame = 0;
 
   if (!ctx) throw new Error("Could not create fallback canvas compositor");
+
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
 
   const size = fitCanvasSize(captureOptions);
   canvas.width = size.width;
@@ -184,11 +191,8 @@ const createCanvasComposer = async ({
         0,
         Math.min(1, (currentPipOptions.pipOpacity || 100) / 100)
       );
-      const radius = Math.round(
-        (layout.width *
-          Math.max(0, Number(currentPipOptions.pipBorderRadius || 0))) /
-          100
-      );
+      // Border radius control removed — always use no corner rounding for overlay rectangles
+      const radius = 0;
 
       ctx.save();
       if (currentPipOptions.pipShape === "circle") {
@@ -232,6 +236,16 @@ const createCanvasComposer = async ({
     start() {
       running = true;
       draw();
+    },
+    pause() {
+      running = false;
+      cancelAnimationFrame(animationFrame);
+    },
+    resume() {
+      if (!running) {
+        running = true;
+        draw();
+      }
     },
     updateOptions(options) {
       Object.assign(currentPipOptions, options || {});
@@ -291,7 +305,11 @@ export const createMediaRecorderFallback = async ({
 
   const recorder = new MediaRecorder(
     stream,
-    mimeType ? { mimeType } : undefined
+    {
+      ...(mimeType ? { mimeType } : {}),
+      videoBitsPerSecond: captureOptions.videoBitrate,
+      audioBitsPerSecond: captureOptions.audioBitrate,
+    }
   );
   mimeType = recorder.mimeType || mimeType || "video/webm";
 
@@ -325,6 +343,18 @@ export const createMediaRecorderFallback = async ({
     start() {
       composer?.start();
       recorder.start(1000);
+    },
+    pause() {
+      if (recorder.state === "recording") {
+        recorder.pause();
+        composer?.pause?.();
+      }
+    },
+    resume() {
+      if (recorder.state === "paused") {
+        recorder.resume();
+        composer?.resume?.();
+      }
     },
     async stop() {
       if (recorder.state !== "inactive") {

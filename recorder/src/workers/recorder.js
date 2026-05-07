@@ -19,6 +19,16 @@ self.onmessage = async (event) => {
       return;
     }
 
+    if (type === "pause") {
+      state.controller?.pause?.();
+      return;
+    }
+
+    if (type === "resume") {
+      state.controller?.resume?.();
+      return;
+    }
+
     if (type === "stop") {
       await state.controller?.stop();
       state.controller = null;

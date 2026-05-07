@@ -36,7 +36,13 @@ const getSizeCandidates = ({ width, height }) => {
   });
 };
 
-export const chooseVideoEncoderConfig = async ({ width, height, fps, bitrate }) => {
+export const chooseVideoEncoderConfig = async ({
+  width,
+  height,
+  fps,
+  bitrate,
+  bitrateMode = "variable",
+}) => {
   const base = {
     framerate: fps,
     latencyMode: "realtime",
@@ -58,12 +64,12 @@ export const chooseVideoEncoderConfig = async ({ width, height, fps, bitrate }) 
     { codec: "avc1.4D401F", hardwareAcceleration: "prefer-software" },
     { codec: "avc1.42E01E", hardwareAcceleration: "prefer-software" },
   ];
-  const bitrateModes = ["variable", "constant", undefined];
+  const bitrateModes = [bitrateMode, bitrateMode === "variable" ? undefined : "variable", undefined];
   const avcOptions = [{ format: "avc" }, undefined];
 
   for (const size of getSizeCandidates({ width, height })) {
     const scaledBitrate = Math.max(
-      4_000_000,
+      500_000,
       Math.round(bitrate * ((size.width * size.height) / (width * height)))
     );
 
